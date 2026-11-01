@@ -4,7 +4,7 @@
 
 **GO**
 
-WO-GIT-00 GO가 먼저 끝났다. 기존 51개 회귀와 WO-03 단위 테스트, 공개 HTML 추출, gallery-dl 목록, yt-dlp 조회, 허용된 이미지·영상 파일 저장, SQLite v2 행 보존, 네이티브 창 플래그, 내부 주소 거부를 이 트리에서 실행했다. GitHub Actions는 실행하지 않았으므로 CI는 NOT RUN이다. WO-00E는 BLOCKED다.
+WO-GIT-00 GO가 먼저 끝났다. 기존 51개 회귀와 WO-03 단위 테스트, 공개 HTML 추출, gallery-dl 목록, yt-dlp 조회, 허용된 이미지·영상 파일 저장, SQLite v2 행 보존, 네이티브 창 플래그, 내부 주소 거부를 이 트리에서 실행했다. GitHub Actions의 단위 잡도 실행되어 통과했다. 5,000장 잡은 켜지 않았다. WO-00E는 BLOCKED다.
 
 ## 저장소
 
@@ -19,7 +19,7 @@ WO-GIT-00 GO가 먼저 끝났다. 기존 51개 회귀와 WO-03 단위 테스트,
   - `adddf6c65215f187bc1b747123189aceeea2ae70` 미리보기, 큐, SQLite v3
 - 문서 커밋: `ee4e98adb8c721685004d67841a7e1eae82edfb0`
 - Pull Request: https://github.com/scarlel96-design/Universal-Media-Downloader/pull/2
-- 머지 커밋은 머지가 끝난 뒤에만 알 수 있다.
+- main 머지 커밋: `2e07ec750f754599ba2c7edcd68fc5a3ebc9c095`
 - Force push와 원격 브랜치 삭제는 하지 않는다.
 
 ## 네트워크
@@ -85,7 +85,16 @@ SKIP은 없다. 부하 테스트 직후 한 번은 WO-01 로컬 저장 두 건�
 
 `.github/workflows/ci.yml`은 `workflow_dispatch`만 있다. `pull_request`와 `push` 트리거는 없다. 두 잡 모두 `windows-latest`다. Qt는 `QT_QPA_PLATFORM=offscreen`, `QT_QUICK_CONTROLS_STYLE=Basic`, `QSG_RHI_BACKEND=software`다. 기본 잡은 5,000장 테스트와 `tests/live`를 제외한다. 부하 테스트는 입력 `load`가 참일 때만 돈다.
 
-GitHub 문서 기준으로 공개 저장소의 표준 GitHub 호스트 러너는 무료다. 더 큰 러너는 공개 저장소에서도 과금된다. 이 워크플로는 표준 `windows-latest`만 쓴다. `workflow_dispatch`는 기본 브랜치의 워크플로 파일을 읽으므로, 이 파일이 main에 있기 전에는 실행할 수 없다. 이번 단계에서 실행하지 않았다. CI 상태는 **NOT RUN**이다.
+GitHub 문서 기준으로 공개 저장소의 표준 GitHub 호스트 러너는 무료다. 더 큰 러너는 공개 저장소에서도 과금된다. 이 워크플로는 표준 `windows-latest`만 쓴다.
+
+main `2e07ec750f754599ba2c7edcd68fc5a3ebc9c095`에 워크플로가 들어간 뒤 `workflow_dispatch`로 한 번 실행했다.
+
+- 실행: https://github.com/scarlel96-design/Universal-Media-Downloader/actions/runs/41312197710
+- 결론: success
+- `test` 잡: 88 passed in 30.78s
+- `load` 잡: 입력을 켜지 않아 실행하지 않음
+
+이 결과는 로컬 5,000장 측정과 로컬 공개 사이트 테스트를 대체하지 않는다.
 
 ## 비용과 업로드
 
@@ -95,7 +104,7 @@ GitHub 문서 기준으로 공개 저장소의 표준 GitHub 호스트 러너는
 
 - WO-00E 역컴파일: BLOCKED
 - Win+Z / Snap, Alt+Space, Alt+F4, 실제 DPI 전환, 고대비, 스크린 리더, 300ms 프레임 계측, QFileDialog: NOT RUN
-- GitHub Actions 실행: NOT RUN
+- GitHub Actions 5,000장 잡: 실행하지 않음. 단위 잡은 위 실행에서 통과했다.
 - YouTube 로그인, 개인 재생목록, DRM, Tor, 프록시: 구현하지 않음
 
 ## 다음 단계
