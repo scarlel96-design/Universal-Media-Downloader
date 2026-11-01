@@ -10,23 +10,31 @@ from __future__ import annotations
 import select
 import socket
 import threading
+import time
 from urllib.parse import urlsplit
 
 from umd.netpolicy import PolicyError, assess_public_url
+
+
+PROXY_TUNNEL_LIMIT = 16
 
 
 class PolicyProxy:
     last_port = 0
     denied_all: list[str] = []
 
-    def __init__(self, network_mode: str = "local", *, resolver=None) -> None:
+    def __init__(self, network_mode: str = "local", *, resolver=None, tunnel_limit: int = PROXY_TUNNEL_LIMIT) -> None:
         self.network_mode = network_mode
         self._resolver = resolver
         self._connect = socket.create_connection
         self.denied: list[str] = []
         self.targets: list[tuple[str, int]] = []
         self.hosts: list[str] = []
+        self.refused = 0
+        self._slots = threading.Semaphore(max(1, int(tunnel_limit)))
         self._stop = threading.Event()
+        self._clients: list[threading.Thread] = []
+        self._open: list[socket.socket] = []
         self._socket = socket.create_server(("127.0.0.1", 0), backlog=64)
         self.port = int(self._socket.getsockname()[1])
         self._thread = threading.Thread(target=self._accept, name="umd-policy-proxy", daemon=True)
@@ -43,6 +51,14 @@ class PolicyProxy:
             self._socket.close()
         except OSError:
             pass
+        for sock in list(self._open):
+            try:
+                sock.close()
+            except OSError:
+                pass
+        self._thread.join(timeout=2)
+        for thread in list(self._clients):
+            thread.join(timeout=1)
 
     def pin_for(self, host: str, port: int) -> str:
         cleaned = host.strip("[]").lower().rstrip(".")
@@ -74,7 +90,18 @@ class PolicyProxy:
                 continue
             except OSError:
                 return
-            threading.Thread(target=self._client, args=(client,), daemon=True).start()
+            if not self._slots.acquire(blocking=False):
+                self.refused += 1
+                # Windows aborts the socket when close() runs with unread
+                # bytes, which drops the 403. Read the request first.
+                _drain(client)
+                _reject(client, "연결 수가 한도를 넘었습니다")
+                _close_socket(client)
+                continue
+            self._open.append(client)
+            thread = threading.Thread(target=self._client, args=(client,), daemon=True)
+            self._clients.append(thread)
+            thread.start()
 
     def _client(self, client: socket.socket) -> None:
         remote: socket.socket | None = None
@@ -121,14 +148,10 @@ class PolicyProxy:
             for sock in (remote, client):
                 if sock is None:
                     continue
-                try:
-                    sock.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
-                try:
-                    sock.close()
-                except OSError:
-                    pass
+                _close_socket(sock)
+            if client in self._open:
+                self._open.remove(client)
+            self._slots.release()
 
 
 def _host_port(target: str, default: int) -> tuple[str, int]:
@@ -140,6 +163,39 @@ def _host_port(target: str, default: int) -> tuple[str, int]:
     if separator and port.isdigit():
         return host, int(port)
     return target, default
+
+
+def _drain(client: socket.socket) -> None:
+    try:
+        client.settimeout(0.5)
+        data = b""
+        while b"\r\n\r\n" not in data and len(data) < 65536:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        pass
+
+
+def _close_socket(client: socket.socket) -> None:
+    """Let the peer read the response, then close.
+
+    Closing with unread bytes, or closing before the 403 is acknowledged,
+    makes Windows reset the socket and drop the response.
+    """
+
+    try:
+        client.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+    # A blocking read here deadlocks Chromium: it waits for this socket
+    # while this thread waits for Chromium to close it.
+    time.sleep(0.05)
+    try:
+        client.close()
+    except OSError:
+        pass
 
 
 def _reject(client: socket.socket, message: str) -> None:

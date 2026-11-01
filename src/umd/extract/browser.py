@@ -114,9 +114,8 @@ def extract_dynamic(url: str, *, network_mode: str = "local", headless: bool = T
 
 
 def _extract_once(url: str, network_mode: str, headless: bool, *, playwright_factory, started: float) -> ExtractResult:
-    # Local fixtures are already pinned to 127.0.0.1. Routing them through a
-    # forwarding proxy resets the socket on this Windows host. Public mode
-    # still uses the proxy, because that is what pins the checked address.
+    # Local fixtures stay off the proxy. Routing loopback through it resets the
+    # socket on this Windows host. Public mode still pins every connection.
     proxy = PolicyProxy(network_mode) if network_mode == "public" else None
     browser = None
     try:
@@ -133,9 +132,9 @@ def _extract_once(url: str, network_mode: str, headless: bool, *, playwright_fac
             if proxy is not None:
                 launch["proxy"] = {"server": proxy.url, "bypass": "<-loopback>"}
             browser = playwright.chromium.launch(**launch)
-            context = browser.new_context(viewport={"width": 1100, "height": 720}, ignore_https_errors=False)
+            context = browser.new_context(**context_options())
             page = context.new_page()
-            page.route("**/*", lambda route: _gate(route, network_mode))
+            arm_page(page, network_mode)
             page.set_default_timeout(15000)
             _goto(page, url)
             _settle(page)
@@ -189,14 +188,146 @@ def collapse_variants(records: list[MediaRecord]) -> list[MediaRecord]:
     return list(chosen.values())
 
 
-def _gate(route, network_mode: str) -> None:
-    host = (urlsplit(route.request.url).hostname or "").lower().rstrip(".")
+def context_options() -> dict:
+    """Service workers stay off. Playwright does not route them through the gate."""
+
+    return {
+        "viewport": {"width": 1100, "height": 720},
+        "ignore_https_errors": False,
+        "service_workers": "block",
+    }
+
+
+_WS_GUARD = """
+(() => {
+  const Native = window.WebSocket;
+  if (!Native || window.__umdWsGuard) return;
+  window.__umdWsGuard = true;
+  const allowed = new Set(["127.0.0.1", "localhost"]);
+  function Guard(url, protocols) {
+    let host = "";
+    try { host = new URL(String(url), location.href).hostname.toLowerCase(); } catch (error) { host = ""; }
+    if (!allowed.has(host)) throw new Error("blocked");
+    return protocols === undefined ? new Native(url) : new Native(url, protocols);
+  }
+  Guard.prototype = Native.prototype;
+  Guard.CONNECTING = Native.CONNECTING;
+  Guard.OPEN = Native.OPEN;
+  Guard.CLOSING = Native.CLOSING;
+  Guard.CLOSED = Native.CLOSED;
+  window.WebSocket = Guard;
+})();
+"""
+
+
+def arm_page(page, network_mode: str) -> None:
+    """Install the request gate. A page that cannot take the gate is not used.
+
+    Playwright's sync WebSocket route stalls this host when a socket is opened,
+    so local mode disables non-loopback sockets in the page instead. Public
+    mode still sends those sockets through the pinning proxy.
+    """
+
+    try:
+        page.route("**/*", lambda route: _gate(route, network_mode))
+        if network_mode != "public":
+            page.add_init_script(_WS_GUARD)
+    except Exception as exc:
+        raise ExtractError("브라우저 접근 정책을 적용할 수 없어 분석을 하지 않습니다") from exc
+
+
+def _socket_allowed(url: str, network_mode: str) -> bool:
+    parts = urlsplit(url)
+    if parts.scheme not in {"ws", "wss", "http", "https"}:
+        return False
+    host = (parts.hostname or "").lower().rstrip(".")
     if network_mode != "public":
-        if host not in {"127.0.0.1", "localhost"}:
+        return host in {"127.0.0.1", "localhost"}
+    from umd.netpolicy import assess_public_url
+
+    probe = "https" if parts.scheme in {"wss", "https"} else "http"
+    decision = assess_public_url(f"{probe}://{host}/")
+    return bool(decision.allowed)
+
+
+_REDIRECTS = {301, 302, 303, 307, 308}
+_DROP_HEADERS = {"connection", "transfer-encoding", "content-encoding", "content-length", "keep-alive"}
+
+
+def _local_host(url: str) -> bool:
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"}:
+        return False
+    host = (parts.hostname or "").lower().rstrip(".")
+    return host in {"127.0.0.1", "localhost"}
+
+
+def _read_without_redirect(url: str) -> tuple[int, dict[str, str], bytes]:
+    """Read one response. A redirect is returned, not followed.
+
+    Playwright on this host does not route the browser's next hop, and
+    ``route.fetch`` inside the sync handler never returns. Reading here keeps
+    that hop from leaving the policy.
+    """
+
+    import urllib.error
+    import urllib.request
+
+    class _Stop(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(_Stop)
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with opener.open(request, timeout=10) as response:
+            headers = {key: value for key, value in response.headers.items()}
+            return response.status, headers, response.read()
+    except urllib.error.HTTPError as exc:
+        headers = {key: value for key, value in exc.headers.items()}
+        return exc.code, headers, exc.read()
+
+
+def _fulfill_local(route) -> None:
+    from urllib.parse import urljoin
+
+    url = route.request.url
+    try:
+        status, headers, body = _read_without_redirect(url)
+    except Exception:
+        route.abort()
+        return
+    for _ in range(4):
+        if status not in _REDIRECTS:
+            break
+        location = headers.get("Location") or headers.get("location") or ""
+        target = urljoin(url, location) if location else ""
+        if not _local_host(target):
+            host = (urlsplit(target).hostname or "").lower().rstrip(".")
             PolicyProxy.denied_all.append(host)
             route.abort()
             return
-        route.continue_()
+        url = target
+        try:
+            status, headers, body = _read_without_redirect(url)
+        except Exception:
+            route.abort()
+            return
+    if status in _REDIRECTS:
+        route.abort()
+        return
+    clean = {key: value for key, value in headers.items() if key.lower() not in _DROP_HEADERS}
+    route.fulfill(status=status, headers=clean, body=body)
+
+
+def _gate(route, network_mode: str) -> None:
+    host = (urlsplit(route.request.url).hostname or "").lower().rstrip(".")
+    if network_mode != "public":
+        if not _local_host(route.request.url):
+            PolicyProxy.denied_all.append(host)
+            route.abort()
+            return
+        _fulfill_local(route)
         return
     from umd.netpolicy import assess_public_url
 

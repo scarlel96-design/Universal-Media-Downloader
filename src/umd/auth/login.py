@@ -21,7 +21,7 @@ def open_login_window(url: str, store: SessionStore, *, headless: bool = False, 
         raise ExtractError("브라우저 분석은 이 환경에서 비활성화되어 있습니다")
     from playwright.sync_api import sync_playwright
 
-    from umd.extract.browser import _gate, _goto
+    from umd.extract.browser import _goto, arm_page, context_options
 
     host = (urlsplit(url).hostname or "").lower()
     local = host in {"127.0.0.1", "localhost"}
@@ -36,9 +36,9 @@ def open_login_window(url: str, store: SessionStore, *, headless: bool = False, 
             if proxy is not None:
                 launch["proxy"] = {"server": proxy.url, "bypass": "<-loopback>"}
             browser = playwright.chromium.launch(**launch)
-            context = browser.new_context(viewport={"width": 1100, "height": 720})
+            context = browser.new_context(**context_options())
             page = context.new_page()
-            page.route("**/*", lambda route: _gate(route, "local" if local else "public"))
+            arm_page(page, "local" if local else "public")
             _goto(page, url)
             if interact is not None:
                 interact(page)

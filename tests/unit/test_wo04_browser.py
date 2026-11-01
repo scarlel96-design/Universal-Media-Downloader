@@ -90,6 +90,13 @@ class _Origin:
                 data += chunk
             target = data.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="replace").split(" ")
             path = urlsplit(target[1] if len(target) > 1 else "/").path
+            if path == "/redirect-internal":
+                connection.sendall(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://10.1.2.3/secret\r\n"
+                    b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                time.sleep(0.05)
+                return
             status, body, content_type = _route(path)
             head = (
                 f"HTTP/1.1 {status} OK\r\nContent-Length: {len(body)}\r\n"
@@ -357,6 +364,37 @@ def test_browser_dedupes_thumbnail_and_reads_video_metadata(pages, chromium):
     assert video.records[0].format
     empty = extract_dynamic(pages.url("/empty.html"))
     assert extraction_succeeded(empty) is False
+
+
+def test_redirect_websocket_and_subresource_stay_on_policy(pages, chromium):
+    from umd.extract.browser import _socket_allowed, context_options, extract_dynamic
+    from umd.netpolicy import ExtractError
+
+    assert context_options()["service_workers"] == "block"
+    assert _socket_allowed("ws://10.9.8.7/socket", "local") is False
+    assert _socket_allowed("ws://127.0.0.1/socket", "local") is True
+    assert _socket_allowed("wss://10.1.2.3/socket", "public") is False
+    PolicyProxy.denied_all.clear()
+    try:
+        redirected = extract_dynamic(pages.url("/redirect-internal"))
+    except ExtractError:
+        redirected = None
+    assert redirected is None or extraction_succeeded(redirected) is False
+    assert "10.1.2.3" in PolicyProxy.denied_all
+    PolicyProxy.denied_all.clear()
+    extract_dynamic(pages.url("/policy.html"))
+    assert "10.9.8.7" in PolicyProxy.denied_all
+    from playwright.sync_api import sync_playwright
+
+    from umd.extract.browser import arm_page
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+        page = browser.new_context(**context_options()).new_page()
+        arm_page(page, "local")
+        page.goto(pages.url("/ws.html"), wait_until="domcontentloaded", timeout=8000)
+        assert page.evaluate("() => document.body.dataset.ws") == "blocked"
+        browser.close()
 
 
 def test_mock_login_is_site_local(pages, chromium, tmp_path: Path):

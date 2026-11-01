@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import heapq
 import json
+import linecache
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -31,6 +33,8 @@ _RESTART = "restart"
 _PAUSED = "paused"
 _CANCEL = "cancel"
 _DONE = "done"
+_close_guard_installed = False
+shutdown_10022_events: list[str] = []
 
 
 def _video_kind(url: str, head: bytes) -> str | None:
@@ -236,8 +240,7 @@ class DownloadEngine:
         await self._hosts.retarget(per_host)
 
     async def run(self) -> None:
-        loop = asyncio.get_running_loop()
-        loop.set_exception_handler(_windows_close_handler)
+        install_windows_socket_close()
         if not self.directory.is_dir():
             for item in self.items:
                 self._emit(item, status="실패", error="저장 경로가 올바르지 않습니다", terminal=True)
@@ -278,6 +281,9 @@ class DownloadEngine:
                 await self._schedule()
             finally:
                 self._client = None
+        # The client closes the pool before this line. One more loop turn lets
+        # the proactor finish socket shutdown while the loop is still open.
+        await asyncio.sleep(0)
         self.peak_connections = self._global.peak
 
     async def _schedule(self) -> None:
@@ -820,18 +826,66 @@ class DownloadEngine:
             pass
 
 
-def _windows_close_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
-    """Ignore the Windows proactor shutdown error after the peer already closed.
+def install_windows_socket_close() -> None:
+    """Close the socket even when Windows rejects shutdown with WinError 10022.
 
-    The lab server closes its socket after the body. asyncio then calls
-    shutdown on that socket and raises WinError 10022. The transfer itself has
-    already finished; logging the callback during the run only burns time.
+    CPython's proactor calls ``shutdown(SHUT_RDWR)`` and only then ``close()``.
+    On this host the lab server has already shut the socket, so shutdown raises
+    10022 and ``close()`` never runs. The download task has already finished;
+    this guard only wraps that callback. Any other 10022 still propagates.
     """
 
-    exc = context.get("exception")
-    if isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10022:
+    global _close_guard_installed
+    if _close_guard_installed or sys.platform != "win32":
         return
-    loop.default_exception_handler(context)
+    from asyncio import proactor_events
+
+    original = proactor_events._ProactorBasePipeTransport._call_connection_lost
+
+    def _call_connection_lost(self, exc):
+        try:
+            original(self, exc)
+        except OSError as err:
+            _finish_proactor_socket(self)
+            if _is_proactor_shutdown_10022(err):
+                shutdown_10022_events.append("proactor-shutdown")
+                return
+            raise
+
+    proactor_events._ProactorBasePipeTransport._call_connection_lost = _call_connection_lost
+    _close_guard_installed = True
+
+
+def _finish_proactor_socket(transport) -> None:
+    sock = getattr(transport, "_sock", None)
+    if sock is not None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        transport._sock = None
+    server = getattr(transport, "_server", None)
+    if server is not None:
+        try:
+            server._detach()
+        except Exception:
+            pass
+        transport._server = None
+    transport._called_connection_lost = True
+
+
+def _is_proactor_shutdown_10022(err: BaseException) -> bool:
+    if not isinstance(err, OSError) or getattr(err, "winerror", None) != 10022:
+        return False
+    traceback = err.__traceback__
+    while traceback is not None:
+        code = traceback.tb_frame.f_code
+        if code.co_name == "_call_connection_lost" and code.co_filename.endswith("proactor_events.py"):
+            line = linecache.getline(code.co_filename, traceback.tb_lineno)
+            if "shutdown" in line:
+                return True
+        traceback = traceback.tb_next
+    return False
 
 
 async def _close_quietly(response: httpx.Response) -> None:
