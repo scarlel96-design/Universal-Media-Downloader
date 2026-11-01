@@ -1,0 +1,13 @@
+item,category,status,amount_usd,notes
+4k-existing-license,sunk,not-measured,0,Owned license is not reused by this app. Purchase price was not collected.
+hopper,optional-paid-re,not-installed,0,Not approved. Decompilation blocked.
+ida,optional-paid-re,not-installed,0,Not approved. Decompilation blocked.
+ghidra,optional-free-re,not-installed,0,JDK 21 is present. Ghidra was not installed because decompilation is blocked.
+rea-npm,free-tool,dry-run-only,0,rea-agents 6.7.0 doctor and setup --dry-run. Config not written.
+pyside6-pytest,oss,installed-in-venv,0,Project-local virtualenv. No system install.
+yt-dlp,oss,not-yet,0,Deferred to WO-03.
+gallery-dl,oss,not-yet,0,Deferred to WO-03.
+ffmpeg,oss,not-yet,0,Deferred to WO-03. LGPL versus GPL build must be chosen before packaging.
+playwright,oss,not-yet,0,Deferred to WO-04.
+external-api,metered,not-used,0,No YouTube API key and no paid RE service.
+labor-savings,unmeasured,not-run,0,Do not treat estimates as measured savings.

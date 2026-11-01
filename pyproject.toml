@@ -1,0 +1,28 @@
+[project]
+name = "universal-media-downloader"
+version = "0.1.0"
+description = "Universal Media Downloader V1.1 — native Windows shell and clean-room design baseline"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "PySide6>=6.8",
+  "httpx>=0.27",
+]
+
+[project.scripts]
+umd = "umd.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+umd = ["ui/qml/*.qml", "ui/qml/components/*.qml", "ui/qml/components/qmldir"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

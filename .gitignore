@@ -1,0 +1,44 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.qmlc/
+*.qmlc
+
+.env
+.env.*
+
+# credentials, tokens, and browser sessions
+*.pem
+*.key
+cookies.txt
+*cookies*
+*.session
+
+# personal downloads and in-progress transfers
+*.part
+Downloads/
+
+# databases created while the app is running
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# caches, coverage, and local tool output
+.cache/
+htmlcov/
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# commercial program binaries and installers
+*.dll
+*.exe
+*.msi
+
+# bulky generated load-test output
+tests/load-output/
+metrics.json
