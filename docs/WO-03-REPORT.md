@@ -17,7 +17,9 @@ WO-GIT-00 GO가 먼저 끝났다. 기존 51개 회귀와 WO-03 단위 테스트,
   - `fb063d2c10961c255a8d62081a1ce6c806cad60c` gallery-dl 목록
   - `6fc8567b75fdbfc82cda37945ac7d1b2472a0a6b` yt-dlp 조회와 다운로드
   - `adddf6c65215f187bc1b747123189aceeea2ae70` 미리보기, 큐, SQLite v3
-- 문서 커밋과 Pull Request 주소는 이 파일을 푸시한 뒤 PR 본문에 적는다. 머지 커밋은 머지 후에만 있다.
+- 문서 커밋: `ee4e98adb8c721685004d67841a7e1eae82edfb0`
+- Pull Request: https://github.com/scarlel96-design/Universal-Media-Downloader/pull/2
+- 머지 커밋은 머지가 끝난 뒤에만 알 수 있다.
 - Force push와 원격 브랜치 삭제는 하지 않는다.
 
 ## 네트워크
