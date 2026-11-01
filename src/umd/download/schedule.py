@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -34,6 +35,9 @@ class EngineConfig:
     per_file_cap: int | None = None
     total_cap: int | None = None
     chunk_size: int = 64 * 1024
+    network_mode: str = "local"
+    resolver: Callable[[str, int], list[str]] | None = None
+    transport: object | None = None
 
     def limits(self) -> tuple[int, int]:
         if self.preset not in PRESETS and (self.global_limit is None or self.per_host is None):
