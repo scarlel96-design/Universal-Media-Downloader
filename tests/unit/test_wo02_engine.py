@@ -544,8 +544,8 @@ def test_sqlite_v1_migrates_without_dropping_rows(tmp_path: Path):
     connection.close()
 
     library = Library(str(database))
-    assert library.schema_version == SCHEMA_VERSION == 2
-    assert library._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert library.schema_version == SCHEMA_VERSION == 3
+    assert library._conn.execute("PRAGMA user_version").fetchone()[0] == 3
     items = library.items("job")
     assert len(items) == 1
     assert items[0]["title"] == "Dot"

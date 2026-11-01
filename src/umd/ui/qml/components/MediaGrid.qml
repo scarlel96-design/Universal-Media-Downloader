@@ -121,6 +121,12 @@ Rectangle {
             }
         }
 
+        Row {
+            spacing: 6
+            NetworkChip { label: "로컬"; mode: "local" }
+            NetworkChip { label: "공개"; mode: "public" }
+        }
+
         Column {
             visible: shell.metricsVisible
             width: parent.width
@@ -169,6 +175,7 @@ Rectangle {
         boundsBehavior: Flickable.StopAtBounds
         clip: true
         keyNavigationEnabled: true
+        cacheBuffer: Math.max(cellHeight, 1)
 
         delegate: Item {
             required property string title
@@ -353,6 +360,33 @@ Rectangle {
                     NumberAnimation { duration: motion.buttonHoverMs }
                 }
             }
+        }
+    }
+
+    component NetworkChip: Rectangle {
+        property string label: ""
+        property string mode: "local"
+        readonly property bool active: shell.networkMode === mode
+        width: networkText.width + 20
+        height: 26
+        radius: 8
+        color: active ? ink.accent : "transparent"
+        border.color: active ? ink.accent : ink.border
+        Accessible.role: Accessible.Button
+        Accessible.name: label + " 네트워크 모드"
+        Accessible.onPressAction: shell.setNetworkMode(mode)
+        Text {
+            id: networkText
+            anchors.centerIn: parent
+            text: label
+            color: active ? "white" : ink.text
+            font.pixelSize: 11
+            font.family: "Segoe UI Variable Text"
+        }
+        MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: shell.setNetworkMode(mode)
         }
     }
 

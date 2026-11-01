@@ -60,6 +60,22 @@ def _sample_row(title: str, kind: str, selected: bool, hue: int) -> dict:
         "retryCount": 0,
         "priority": 0,
         "note": "",
+        "mediaType": kind,
+        "extractorId": "",
+        "extractorVersion": "",
+        "mediaReference": "",
+        "thumbnailUrl": "",
+        "originalUrl": "",
+        "width": None,
+        "height": None,
+        "duration": None,
+        "format": "",
+        "formatId": "",
+        "formats": [],
+        "filesize": None,
+        "filesizeNote": "",
+        "delivery": "http",
+        "subtitles": "",
     }
 
 
@@ -68,13 +84,19 @@ def row_from_candidate(item: dict, page_url: str) -> dict:
     reasons = item.get("reasons") or []
     if isinstance(reasons, list):
         reasons = " · ".join(str(part) for part in reasons)
-    url = str(item["url"])
+    url = str(item.get("originalUrl") or item["url"])
+    kind = str(item.get("mediaType") or "image")
+    if kind not in {"image", "video", "file"}:
+        kind = "image"
+    filesize = item.get("filesize")
+    known_size = int(filesize) if isinstance(filesize, int) and filesize > 0 else 0
+    thumb = str(item.get("thumbnailUrl") or "")
     return {
         "title": str(item.get("title") or "image"),
-        "kind": "image",
+        "kind": kind,
         "selected": classification == "content",
         "hue": media_hue(url),
-        "previewUrl": url,
+        "previewUrl": thumb or url,
         "classification": classification,
         "reasons": reasons,
         "status": "대기",
@@ -83,12 +105,12 @@ def row_from_candidate(item: dict, page_url: str) -> dict:
         "pageUrl": page_url,
         "override": "",
         "itemId": "",
-        "error": "",
+        "error": str(item.get("error") or ""),
         "savedPath": "",
         "byteSize": 0,
         "downloaded": 0,
-        "totalSize": 0,
-        "progress": -1.0,
+        "totalSize": known_size,
+        "progress": 0.0 if known_size else -1.0,
         "partPath": "",
         "etag": "",
         "lastModified": "",
@@ -96,7 +118,46 @@ def row_from_candidate(item: dict, page_url: str) -> dict:
         "retryCount": 0,
         "priority": 0,
         "note": "",
+        "mediaType": kind,
+        "extractorId": str(item.get("extractorId") or ""),
+        "extractorVersion": str(item.get("extractorVersion") or ""),
+        "mediaReference": str(item.get("mediaReference") or url),
+        "thumbnailUrl": thumb,
+        "originalUrl": url,
+        "width": item.get("width"),
+        "height": item.get("height"),
+        "duration": item.get("duration"),
+        "format": str(item.get("format") or ""),
+        "formatId": str(item.get("formatId") or ""),
+        "formats": list(item.get("formats") or []),
+        "filesize": known_size or None,
+        "filesizeNote": str(item.get("filesizeNote") or ""),
+        "delivery": str(item.get("delivery") or ("yt-dlp" if kind == "video" else "http")),
+        "subtitles": str(item.get("subtitles") or ""),
     }
+
+
+def _detail_meta(item: dict) -> str:
+    width = item.get("width")
+    height = item.get("height")
+    if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+        size = f"{width}×{height}"
+    else:
+        size = "미확인"
+    duration = item.get("duration")
+    if isinstance(duration, (int, float)) and duration > 0:
+        length = f"{max(1, int(duration))}초"
+    else:
+        length = "미확인"
+    filesize = item.get("filesize")
+    if isinstance(filesize, int) and filesize > 0:
+        amount = _format_bytes(filesize)
+    else:
+        amount = str(item.get("filesizeNote") or "") or "미확인"
+    extractor = str(item.get("extractorId") or "") or "미확인"
+    subtitles = str(item.get("subtitles") or "")
+    caption = subtitles or "자막 미확인"
+    return f"{size} · {length} · {amount} · {extractor} · {caption}"
 
 
 def _format_bytes(size: int) -> str:
@@ -480,6 +541,7 @@ class ShellState(QObject):
     notesChanged = Signal()
     showExcludedChanged = Signal()
     progressChanged = Signal()
+    networkModeChanged = Signal()
 
     def __init__(
         self,
@@ -521,6 +583,11 @@ class ShellState(QObject):
         self._off_ui = False
         self._active_ids: list[str] = []
         self._mode = "균형"
+        self._network_mode = "local"
+        self._detail_format = ""
+        self._detail_meta = ""
+        self._detail_error = ""
+        self._format_choices: list[str] = []
         self._per_file_cap: int | None = None
         self._total_cap: int | None = None
         self._metrics_visible = False
@@ -580,7 +647,11 @@ class ShellState(QObject):
     @Property(str, notify=detailChanged)
     def detailKind(self) -> str:
         if self._detail_kind == "video":
-            return "영상 샘플"
+            if not self._detail_id and self._using_samples:
+                return "영상 샘플"
+            return self._detail_format or "영상"
+        if self._detail_kind == "file":
+            return self._detail_format or "파일"
         if self._detail_id or not self._using_samples:
             return "이미지"
         return "이미지 샘플"
@@ -656,6 +727,22 @@ class ShellState(QObject):
     @Property(str, notify=detailChanged)
     def detailProgress(self) -> str:
         return self._detail_progress
+
+    @Property(str, notify=detailChanged)
+    def detailMeta(self) -> str:
+        return self._detail_meta
+
+    @Property(str, notify=detailChanged)
+    def detailError(self) -> str:
+        return self._detail_error
+
+    @Property("QStringList", notify=detailChanged)
+    def formatChoices(self) -> list[str]:
+        return self._format_choices
+
+    @Property(str, notify=networkModeChanged)
+    def networkMode(self) -> str:
+        return self._network_mode
 
     @Property(int, notify=progressChanged)
     def doneCount(self) -> int:
@@ -800,6 +887,31 @@ class ShellState(QObject):
         self.urlChanged.emit()
 
     @Slot(str)
+    def setNetworkMode(self, mode: str) -> None:
+        if mode not in {"local", "public"}:
+            return
+        self._network_mode = mode
+        self.networkModeChanged.emit()
+
+    @Slot(str)
+    def selectFormat(self, format_id: str) -> None:
+        row = self._model.find_id(self._detail_id)
+        if row is None:
+            return
+        chosen = next((item for item in row.get("formats") or [] if str(item.get("id")) == format_id), None)
+        if chosen is None:
+            return
+        row["formatId"] = format_id
+        row["format"] = str(chosen.get("label") or format_id)
+        if chosen.get("filesize"):
+            row["filesize"] = int(chosen["filesize"])
+            row["totalSize"] = int(chosen["filesize"])
+        row["filesizeNote"] = str(chosen.get("filesizeNote") or "")
+        if self._library is not None and self._detail_id:
+            self._library.apply_transfer(self._detail_id, {"format": row["format"]})
+        self._show_detail(row)
+
+    @Slot(str)
     def setDownloadDirectory(self, path: str) -> None:
         self._download_dir = path
 
@@ -833,6 +945,10 @@ class ShellState(QObject):
         self._detail_hue = int(item["hue"])
         self._detail_id = item.get("itemId") or ""
         fetch = item.get("fetchUrl") or ""
+        self._format_choices = []
+        self._detail_format = str(item.get("format") or "")
+        self._detail_error = ""
+        self._detail_meta = ""
         if not fetch:
             self._detail_preview = ""
             self._detail_source = "시안 데이터"
@@ -846,6 +962,14 @@ class ShellState(QObject):
             self._detail_relevance = CLASS_LABELS.get(classification, classification)
             self._detail_status = item.get("status") or "대기"
             self._detail_reasons = item.get("reasons") or ""
+            self._detail_error = str(item.get("error") or "")
+            self._detail_meta = _detail_meta(item)
+            selected_id = str(item.get("formatId") or "")
+            self._format_choices = [
+                f"{choice.get('id')}|{choice.get('label')}|{1 if str(choice.get('id')) == selected_id else 0}"
+                for choice in item.get("formats") or []
+                if choice.get("id")
+            ]
         self.detailChanged.emit()
 
     @Slot()
@@ -878,11 +1002,11 @@ class ShellState(QObject):
         if self._extract_thread is not None and self._extract_thread.isRunning():
             self._notify("이미 추출 중입니다.")
             return
-        if not is_allowed_url(self._url.strip()):
+        if self._network_mode != "public" and not is_allowed_url(self._url.strip()):
             self._notify("이 단계에서는 로컬 파일과 127.0.0.1 테스트 서버만 분석합니다.")
             return
         self._set_phase("추출 중", persist=False)
-        worker = ExtractWorker(self._url.strip())
+        worker = ExtractWorker(self._url.strip(), self._network_mode)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -1017,6 +1141,7 @@ class ShellState(QObject):
             per_host=per_host,
             per_file_cap=self._per_file_cap,
             total_cap=self._total_cap,
+            network_mode=self._network_mode,
         )
 
     @Slot(str)

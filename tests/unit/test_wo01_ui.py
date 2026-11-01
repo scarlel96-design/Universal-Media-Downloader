@@ -8,6 +8,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 
 from umd.app.shell import ShellBundle
+from umd.storage.database import SCHEMA_VERSION
 from wo01_support import EXPECTED, PHOTOS, base_url, serve
 
 QML = Path(__file__).resolve().parents[2] / "src" / "umd" / "ui" / "qml" / "Main.qml"
@@ -174,7 +175,7 @@ def test_12_sqlite_restores_the_finished_job(server, app, tmp_path: Path):
     dot = next(item for item in restored_bundle.library.items(job_id) if item["title"] == "Dot")
     assert dot["download_status"] == "완료"
     assert Path(dot["saved_path"]).read_bytes() == (PHOTOS / "dot.png").read_bytes()
-    assert restored_bundle.library.schema_version == 2
+    assert restored_bundle.library.schema_version == SCHEMA_VERSION
     assert restored_bundle.library.integrity_issues() == []
     Path(dot["saved_path"]).unlink()
     assert restored_bundle.library.integrity_issues() == [f"missing:{dot['id']}"]
