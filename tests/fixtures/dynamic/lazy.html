@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<body>
+<article id="post" data-umd-dynamic="1" style="min-height: 2400px"></article>
+<script>
+  var done = false;
+  function reveal() {
+    if (done || window.scrollY < 500) return;
+    done = true;
+    var img = document.createElement("img");
+    img.src = "/media/lazy.png";
+    img.alt = "lazy body";
+    img.width = 320;
+    img.height = 200;
+    document.getElementById("post").appendChild(img);
+    document.body.dataset.umdSettled = "1";
+  }
+  window.addEventListener("scroll", reveal);
+</script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<body>
+<article id="post" data-umd-dynamic="1"></article>
+<script>
+  function render() {
+    var id = (location.hash || "#/post/1").replace("#/post/", "");
+    var post = document.getElementById("post");
+    post.innerHTML = "";
+    var img = document.createElement("img");
+    img.src = "/media/post-" + id + ".png";
+    img.alt = "post " + id;
+    img.width = 400;
+    img.height = 300;
+    post.appendChild(img);
+  }
+  window.addEventListener("hashchange", render);
+  render();
+</script>
+</body>
+</html>

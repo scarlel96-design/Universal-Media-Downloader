@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<body>
+<article id="feed" data-umd-dynamic="1"></article>
+<script>
+  var count = 0;
+  function more() {
+    if (count >= 3) {
+      document.body.dataset.umdEnd = "1";
+      return;
+    }
+    count += 1;
+    var img = document.createElement("img");
+    img.src = "/media/scroll-" + count + ".png";
+    img.alt = "scroll " + count;
+    img.width = 220;
+    img.height = 160;
+    document.getElementById("feed").appendChild(img);
+    document.body.style.minHeight = (count * 900) + "px";
+  }
+  more();
+  window.addEventListener("scroll", function () {
+    if (window.scrollY > 80) more();
+  });
+</script>
+</body>
+</html>

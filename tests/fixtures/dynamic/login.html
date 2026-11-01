@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html>
+<body>
+<button id="login" type="button">계속</button>
+<script>
+  document.getElementById("login").addEventListener("click", function () {
+    document.cookie = "umdtest=ok; Path=/";
+    document.body.dataset.umdAuthed = "1";
+  });
+</script>
+</body>
+</html>

@@ -140,6 +140,28 @@ Rectangle {
             accessibleName: "정보 패널"
             onTriggered: shell.toggleInspector()
         }
+        Rectangle {
+            Layout.preferredWidth: 64
+            Layout.preferredHeight: 28
+            Layout.alignment: Qt.AlignVCenter
+            radius: 8
+            color: loginArea.containsMouse ? ink.hover : "transparent"
+            border.color: ink.border
+            Accessible.role: Accessible.Button
+            Accessible.name: "사이트 로그인"
+            Text {
+                anchors.centerIn: parent
+                text: "로그인"
+                color: ink.title
+                font.pixelSize: 11
+                font.family: "Segoe UI Variable Text"
+            }
+            MouseArea {
+                id: loginArea
+                anchors.fill: parent
+                onClicked: shell.openLogin()
+            }
+        }
     }
 
     component IconButton: Rectangle {

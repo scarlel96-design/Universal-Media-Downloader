@@ -122,6 +122,10 @@ class DownloadWorker(QObject):
     def cancel(self) -> None:
         self._cancel_early = True
         self._pause_early = False
+        try:
+            (Path(self._directory) / ".umd-cancel").write_text("1", encoding="ascii")
+        except OSError:
+            pass
         self._call(lambda engine: engine.request_cancel_all())
 
     @Slot()
@@ -192,37 +196,58 @@ class DownloadWorker(QObject):
     def _run_galleries(self, rows: list[dict]) -> None:
         if not rows:
             return
-        from umd.download.gallery_job import download_with_gallery
+        from umd.download.gallery_job import download_selected
 
-        seen: set[str] = set()
+        groups: dict[str, list[dict]] = {}
         for row in rows:
-            if self._cancel_early:
-                self._emit_row(row, status="취소", terminal=True)
+            if row.get("selected", True) is False:
                 continue
             page = str(row.get("mediaReference") or row.get("pageUrl") or "")
-            if not page or page in seen:
-                self._emit_row(row, status="완료", note="같은 파일을 다시 저장하지 않습니다", terminal=True)
+            groups.setdefault(page, []).append(row)
+        for page, group in groups.items():
+            if self._cancel_early:
+                for row in group:
+                    self._emit_row(row, status="취소", terminal=True)
                 continue
-            seen.add(page)
+            only = {
+                str(row.get("originalUrl") or row.get("fetchUrl") or "")
+                for row in group
+            }
+            only.discard("")
             try:
-                paths = download_with_gallery(page, Path(self._directory))
-            except Exception as exc:  # noqa: BLE001 — surfaced as a download error
-                self._emit_row(row, status="실패", error=str(exc)[:300], terminal=True)
+                batch = download_selected(
+                    page,
+                    Path(self._directory),
+                    only,
+                    should_stop=lambda: self._cancel_early,
+                )
+            except Exception as exc:  # noqa: BLE001 — one page failure is not an extractor failure
+                for row in group:
+                    self._emit_row(row, status="실패", error=str(exc)[:300], terminal=True)
                 continue
-            if not paths:
-                self._emit_row(row, status="실패", error="저장한 파일이 없습니다", terminal=True)
-                continue
-            path = paths[0]
-            size = path.stat().st_size
-            self._emit_row(
-                row,
-                status="완료",
-                path=str(path),
-                size=size,
-                downloaded=size,
-                total=size,
-                terminal=True,
-            )
+            saved = {item.url: item for item in batch.files}
+            for row in group:
+                url = str(row.get("originalUrl") or row.get("fetchUrl") or "")
+                item = saved.get(url)
+                if item is None or item.state == "cancelled":
+                    status = "취소" if batch.cancelled or self._cancel_early else "실패"
+                    error = "" if status == "취소" else "저장한 파일이 없습니다"
+                    self._emit_row(row, status=status, error=error, terminal=True)
+                    continue
+                if item.state == "failed":
+                    self._emit_row(row, status="실패", error=item.error or "저장에 실패했습니다", terminal=True)
+                    continue
+                note = "이미 저장된 파일" if item.state == "existing" else ""
+                self._emit_row(
+                    row,
+                    status="완료",
+                    path=item.path,
+                    size=item.size,
+                    downloaded=item.size,
+                    total=item.size,
+                    note=note,
+                    terminal=True,
+                )
 
     def _run_videos(self, rows: list[dict]) -> None:
         pending = list(rows)

@@ -7,6 +7,7 @@ not become a percentage.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -29,6 +30,68 @@ def download_video(
     should_stop,
     on_progress,
 ) -> tuple[Path, int]:
+    if os.environ.get("UMD_IN_WORKER") != "1":
+        return _download_via_child(page_url, directory, format_id, should_stop, on_progress)
+    return _download_inline(page_url, directory, format_id, should_stop, on_progress)
+
+
+def _download_via_child(page_url, directory, format_id, should_stop, on_progress) -> tuple[Path, int]:
+    import json
+    import threading
+
+    from umd.net.isolated import IsolatedStop, call
+
+    require_public(page_url)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    flag = directory / f".umd-video-{os.urandom(4).hex()}"
+    progress = directory / f".umd-progress-{os.urandom(4).hex()}"
+    stop = threading.Event()
+
+    def watch() -> None:
+        last = ""
+        while not stop.wait(0.1):
+            reason = should_stop() or ""
+            if reason:
+                flag.write_text(reason, encoding="ascii")
+            if not progress.is_file():
+                continue
+            text = progress.read_text(encoding="utf-8")
+            if text == last or not text:
+                continue
+            last = text
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            on_progress(int(data.get("downloaded") or 0), int(data.get("total") or -1))
+
+    thread = threading.Thread(target=watch, daemon=True)
+    thread.start()
+    try:
+        result = call(
+            "video-download",
+            {
+                "url": page_url,
+                "directory": str(directory),
+                "formatId": format_id,
+                "cancelFlag": str(flag),
+                "progressPath": str(progress),
+            },
+            timeout=600,
+        )
+    except IsolatedStop as exc:
+        raise TransferStop(exc.reason) from exc
+    finally:
+        stop.set()
+        thread.join(timeout=1)
+        progress.unlink(missing_ok=True)
+        flag.unlink(missing_ok=True)
+    path = Path(str(result.get("path") or ""))
+    return path, int(result.get("size") or 0)
+
+
+def _download_inline(page_url, directory, format_id, should_stop, on_progress) -> tuple[Path, int]:
     require_public(page_url)
     from yt_dlp import YoutubeDL
     from yt_dlp.utils import DownloadError

@@ -20,7 +20,6 @@ from umd.netpolicy import (
     USER_AGENT,
     assess_public_url,
     is_allowed_url,
-    public_resolution,
     strip_userinfo,
 )
 
@@ -35,8 +34,7 @@ class _NoRedirect(HTTPRedirectHandler):
 def fetch_text(url: str, *, network_mode: str = "local") -> tuple[str, str]:
     """Return ``(final_url, html)``. Local mode raises if the URL is not a fixture."""
     if network_mode == "public":
-        with public_resolution():
-            final, data = _fetch_public(url)
+        final, data = _fetch_public(url)
     else:
         if not is_allowed_url(url):
             raise PermissionError("허용되지 않은 주소입니다")

@@ -6,6 +6,7 @@ dropped. YouTube login and personal playlists are not enabled.
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 
@@ -42,6 +43,12 @@ def can_handle(url: str) -> bool:
 
 
 def extract_video(url: str) -> ExtractResult:
+    if os.environ.get("UMD_IN_WORKER") != "1":
+        require_public(url)
+        from umd.extract.model import result_from_payload
+        from umd.net.isolated import call
+
+        return result_from_payload(call("video-extract", {"url": url}))
     from yt_dlp.utils import DownloadError
 
     require_public(url)

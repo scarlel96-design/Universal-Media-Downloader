@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections import deque
+from pathlib import Path
+from urllib.parse import urlsplit
 
 from PySide6.QtCore import (
     Property,
@@ -535,6 +538,7 @@ class ShellState(QObject):
     reduceMotionChanged = Signal()
     countsChanged = Signal()
     detailChanged = Signal()
+    previewChanged = Signal()
     toastChanged = Signal()
     urlChanged = Signal()
     jobPhaseChanged = Signal()
@@ -567,6 +571,12 @@ class ShellState(QObject):
         self._detail_kind = CATALOG[0].kind
         self._detail_hue = CATALOG[0].hue
         self._detail_preview = ""
+        self._preview_source = ""
+        self._preview_note = ""
+        self._preview_muted = True
+        self._preview_playing = False
+        self._detail_fetch = ""
+        self._detail_saved = ""
         self._detail_source = "시안 데이터"
         self._detail_relevance = "본문 미디어(예시)"
         self._detail_status = "다운로드 미연결"
@@ -663,6 +673,26 @@ class ShellState(QObject):
     @Property(str, notify=detailChanged)
     def detailPreview(self) -> str:
         return self._detail_preview
+
+    @Property(bool, notify=detailChanged)
+    def detailIsVideo(self) -> bool:
+        return self._detail_kind == "video" and not self._using_samples
+
+    @Property(str, notify=previewChanged)
+    def previewSource(self) -> str:
+        return self._preview_source
+
+    @Property(str, notify=previewChanged)
+    def previewNote(self) -> str:
+        return self._preview_note
+
+    @Property(bool, notify=previewChanged)
+    def previewMuted(self) -> bool:
+        return self._preview_muted
+
+    @Property(bool, notify=previewChanged)
+    def previewPlaying(self) -> bool:
+        return self._preview_playing
 
     @Property(str, notify=detailChanged)
     def detailSource(self) -> str:
@@ -951,13 +981,23 @@ class ShellState(QObject):
         self._detail_meta = ""
         if not fetch:
             self._detail_preview = ""
+            self._detail_fetch = ""
+            self._detail_saved = ""
+            self._preview_source = ""
+            self._preview_note = ""
+            self._preview_playing = False
+            self.previewChanged.emit()
             self._detail_source = "시안 데이터"
             self._detail_relevance = "본문 미디어(예시)"
             self._detail_status = "다운로드 미연결"
             self._detail_reasons = ""
         else:
             classification = item.get("classification") or "uncertain"
+            self._detail_fetch = fetch
+            self._detail_saved = str(item.get("savedPath") or item.get("path") or "")
             self._detail_preview = item.get("previewUrl") or ""
+            self._guard_authed_preview(fetch)
+            self._arm_preview(item)
             self._detail_source = item.get("mediaUrl") or fetch
             self._detail_relevance = CLASS_LABELS.get(classification, classification)
             self._detail_status = item.get("status") or "대기"
@@ -971,6 +1011,105 @@ class ShellState(QObject):
                 if choice.get("id")
             ]
         self.detailChanged.emit()
+
+    def _guard_authed_preview(self, fetch: str) -> None:
+        from umd.auth.session import cookie_header
+
+        if cookie_header(fetch) or cookie_header(self._detail_preview):
+            self._detail_preview = ""
+            self._preview_note = "인증된 미디어는 저장과 같은 세션으로만 미리봅니다"
+
+    def _arm_preview(self, item: dict) -> None:
+        self._preview_playing = False
+        self._preview_source = ""
+        if item.get("kind") != "video":
+            if "인증된" not in self._preview_note:
+                self._preview_note = ""
+        elif "인증된" not in self._preview_note:
+            self._preview_note = "재생을 누르면 허용된 영상의 앞부분을 미리 봅니다."
+        self.previewChanged.emit()
+
+    def _preview_target(self) -> str:
+        saved = self._detail_saved
+        if saved and Path(saved).is_file():
+            return Path(saved).as_uri()
+        parts = urlsplit(self._detail_fetch or "")
+        host = (parts.hostname or "").lower()
+        if parts.scheme == "file":
+            return self._detail_fetch
+        if parts.scheme in {"http", "https"} and host in {"127.0.0.1", "localhost"}:
+            return self._detail_fetch
+        return ""
+
+    @Slot()
+    def playPreview(self) -> None:
+        if self._detail_kind != "video" or self._using_samples:
+            self._preview_note = "재생할 영상이 없습니다"
+            self._preview_playing = False
+            self.previewChanged.emit()
+            return
+        source = self._preview_target()
+        if not source:
+            self._preview_source = ""
+            self._preview_playing = False
+            self._preview_note = "이 영상은 미리보기를 위해 전체를 받지 않습니다. 형식을 선택한 뒤 저장하세요."
+            self.previewChanged.emit()
+            return
+        self._preview_source = source
+        self._preview_playing = True
+        self._preview_note = ""
+        self.previewChanged.emit()
+
+    @Slot()
+    def pausePreview(self) -> None:
+        self._preview_playing = False
+        self.previewChanged.emit()
+
+    @Slot()
+    def togglePreviewMute(self) -> None:
+        self._preview_muted = not self._preview_muted
+        self.previewChanged.emit()
+
+    @Slot(str)
+    def notePreview(self, message: str) -> None:
+        self._preview_playing = False
+        self._preview_note = message or "코덱 또는 스트리밍 제약으로 미리보기를 재생할 수 없습니다"
+        self.previewChanged.emit()
+
+    @Slot()
+    def openLogin(self) -> None:
+        url = self._url.strip()
+        if not url.startswith(("http://", "https://")):
+            self._notify("로그인할 페이지 주소가 없습니다.")
+            return
+        threading.Thread(target=self._login_thread, args=(url,), daemon=True).start()
+        self._notify("브라우저에서 직접 로그인하세요. 비밀번호는 입력하지 않습니다.")
+
+    def _login_thread(self, url: str) -> None:
+        from umd.auth.login import open_login_window
+        from umd.auth.session import SessionStore, active, set_active
+
+        store = active()
+        if store is None:
+            root = Path(os.environ.get("TEMP") or ".") / "umd-sessions"
+            store = SessionStore(root)
+            set_active(store)
+        try:
+            open_login_window(url, store)
+        except Exception as exc:
+            self._notify(str(exc)[:180])
+            return
+        self._notify("이 사이트의 임시 세션만 유지합니다. 다른 도메인으로는 전달하지 않습니다.")
+
+    @Slot()
+    def logoutSite(self) -> None:
+        from umd.auth.session import active
+
+        host = (urlsplit(self._url.strip()).hostname or "").lower()
+        store = active()
+        if store is not None and host:
+            store.delete(host)
+        self._notify("이 사이트의 임시 세션을 삭제했습니다.")
 
     @Slot()
     def selectAllVisible(self) -> None:

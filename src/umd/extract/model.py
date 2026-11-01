@@ -66,6 +66,45 @@ class MediaRecord:
             "error": self.error,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict, *, source_page_url: str = "") -> MediaRecord:
+        reasons = data.get("reasons") or []
+        return cls(
+            media_type=str(data.get("mediaType") or "image"),
+            extractor_id=str(data.get("extractorId") or data.get("origin") or ""),
+            extractor_version=str(data.get("extractorVersion") or ""),
+            source_page_url=source_page_url,
+            media_reference=str(data.get("mediaReference") or ""),
+            thumbnail_url=str(data.get("thumbnailUrl") or ""),
+            original_url=str(data.get("originalUrl") or data.get("url") or ""),
+            title=str(data.get("title") or ""),
+            width=data.get("width"),
+            height=data.get("height"),
+            duration=data.get("duration"),
+            format=str(data.get("format") or ""),
+            filesize=data.get("filesize"),
+            classification=str(data.get("classification") or "uncertain"),
+            classification_reason=str(reasons[0]) if reasons else "",
+            selected=str(data.get("classification") or "") == "content",
+            download_state="대기",
+            delivery=str(data.get("delivery") or "http"),
+            format_id=str(data.get("formatId") or ""),
+            formats=list(data.get("formats") or []),
+            subtitles=str(data.get("subtitles") or ""),
+            filesize_note=str(data.get("filesizeNote") or ""),
+            error=str(data.get("error") or ""),
+        )
+
+
+def result_from_payload(payload: dict) -> ExtractResult:
+    page = str(payload.get("pageUrl") or "")
+    return ExtractResult(
+        page,
+        str(payload.get("extractorId") or ""),
+        [MediaRecord.from_dict(item, source_page_url=page) for item in payload.get("items") or []],
+        kind=str(payload.get("failureKind") or ""),
+    )
+
 
 @dataclass
 class ExtractResult:

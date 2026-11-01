@@ -14,7 +14,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
@@ -31,6 +31,19 @@ _RESTART = "restart"
 _PAUSED = "paused"
 _CANCEL = "cancel"
 _DONE = "done"
+
+
+def _video_kind(url: str, head: bytes) -> str | None:
+    """Accept a direct video only when the suffix and the file header agree."""
+
+    suffix = PurePosixPath(urlsplit(url).path).suffix.lower()
+    if suffix == ".mp4" and b"ftyp" in head[:32]:
+        return "mp4"
+    if suffix == ".webm" and head.startswith(b"\x1a\x45\xdf\xa3"):
+        return "webm"
+    if suffix in {".ogv", ".ogg"} and head.startswith(b"OggS"):
+        return suffix.lstrip(".")
+    return None
 
 
 @dataclass
@@ -223,6 +236,8 @@ class DownloadEngine:
         await self._hosts.retarget(per_host)
 
     async def run(self) -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(_windows_close_handler)
         if not self.directory.is_dir():
             for item in self.items:
                 self._emit(item, status="실패", error="저장 경로가 올바르지 않습니다", terminal=True)
@@ -466,6 +481,11 @@ class DownloadEngine:
                 headers["If-Range"] = item.etag
             elif item.last_modified:
                 headers["If-Range"] = item.last_modified
+        from umd.auth.session import cookie_header
+
+        cookie = cookie_header(url)
+        if cookie:
+            headers["Cookie"] = cookie
         response = await self._client.send(self._client.build_request("GET", url, headers=headers), stream=True)
         try:
             status = response.status_code
@@ -662,7 +682,10 @@ class DownloadEngine:
             self._discard(item)
             return _Outcome(_PERMANENT, error="빈 응답", http_status=http_status)
         with part.open("rb") as handle:
-            kind = sniff_image(handle.read(16))
+            head = handle.read(32)
+        kind = sniff_image(head)
+        if kind is None:
+            kind = _video_kind(item.url, head)
         if kind is None:
             self._discard(item)
             return _Outcome(_PERMANENT, error="허용되지 않은 이미지 형식", http_status=http_status)
@@ -795,6 +818,20 @@ class DownloadEngine:
                 handle.truncate(size)
         except OSError:
             pass
+
+
+def _windows_close_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Ignore the Windows proactor shutdown error after the peer already closed.
+
+    The lab server closes its socket after the body. asyncio then calls
+    shutdown on that socket and raises WinError 10022. The transfer itself has
+    already finished; logging the callback during the run only burns time.
+    """
+
+    exc = context.get("exception")
+    if isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10022:
+        return
+    loop.default_exception_handler(context)
 
 
 async def _close_quietly(response: httpx.Response) -> None:
