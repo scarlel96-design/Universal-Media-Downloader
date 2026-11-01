@@ -20,6 +20,8 @@ PR 상태: OPEN. 이 작업에서 병합하지 않았다.
 
 안정화 커밋: `25835f2277cfe9dfa9d166ef230ddb45433eeaab`
 
+기록 커밋: `8fccb376b6687d9eba2a0f0c39445026de2857b3`. Actions는 이 SHA를 실행했다.
+
 환경: 로컬 Windows, Python 3.12, 저장소 가상환경. CI 결과와 로컬 결과를 같은 PASS로 적지 않는다.
 
 안정화 판정: 미충족. GO가 아니다.
@@ -41,7 +43,7 @@ WO-00R PR #5는 이 판정에 넣지 않는다. 검토하거나 병합하지 않
 | 쿠키 전송 정책 검증 | PASS. |
 | 선택 다운로드 무결성 | PASS. 이번 단위 재실행의 갤러리 테스트. |
 | 디코딩된 영상 프레임 | PASS. 오프스크린 Qt Multimedia. |
-| GitHub Actions 실행 결과 | NOT RUN. 푸시 뒤에 `workflow_dispatch`를 실행하고 이 표를 갱신한다. |
+| GitHub Actions 실행 결과 | PASS. 테스트 잡만. 부하 잡은 실행하지 않았다. 로컬 FAIL과 별개다. |
 | 필수 실패 없음 | FAIL. `test_11`이 이번 전체 실행에서 실패했다. |
 
 안정화 GO는 위 조건이 모두 맞을 때만 준다. 지금은 주지 않는다.
@@ -193,9 +195,16 @@ Apple 스타일 화면은 유지한다. 기존 Windows 네이티브 제목 표�
 - 5,000장 잡은 `inputs.load`가 켜질 때만 실행된다. 이번 수동 실행에는 그 입력을 켜지 않는다. 부하 결과는 위의 로컬 실행만 사용한다.
 - `actions/checkout@v4`, `actions/setup-python@v5`는 그대로다.
 
-이번 브랜치 실행: NOT RUN.
+이번 브랜치 실행: PASS. 로컬 단위 재실행의 FAIL과 다른 결과다.
 
-실행 주소: 아직 없다. 푸시 후 `gh workflow run ci.yml --ref feat/wo04-browser-extraction`으로 실행하고, 로그에 Chromium 설치와 이번 커밋 SHA가 보이는지 확인한 뒤 이 절을 갱신한다. 기본 브랜치 워크플로만 돈 실행은 이 브랜치의 PASS로 적지 않는다.
+- 주소: https://github.com/scarlel96-design/Universal-Media-Downloader/actions/runs/41362585950
+- 이벤트: `workflow_dispatch`
+- `headSha`: `8fccb376b6687d9eba2a0f0c39445026de2857b3`
+- 테스트 잡: success. 로그에 `python -m playwright install chromium`이 있고, Chrome for Testing 156.0.8078.4 (playwright chromium v1248) 설치가 찍혀 있다.
+- 테스트 잡 pytest: `118 passed in 59.12s`
+- 부하 잡: skipped. `inputs.load`를 켜지 않았다. 5,000장 결과는 로컬 절만 사용한다.
+
+이 실행은 기본 브랜치가 아니라 위 SHA를 체크아웃했다. 앞선 main 실행과 합치지 않는다.
 
 이전 main 실행 `41312197710`은 WO-03 결과다. 이번 PASS가 아니다.
 
@@ -227,15 +236,15 @@ Apple 스타일 화면은 유지한다. 기존 Windows 네이티브 제목 표�
 - 실제 Windows 데스크톱 UI 항목 전부.
 - 프로젝트 `LICENSE`와 그에 따른 gallery-dl, PySide6 배포 의무의 최종 선택.
 - Windows 보안 저장소를 확인하기 전의 영구 세션.
-- 이번 커밋에 대한 GitHub Actions 결과.
+- 로컬에서 재현된 `test_11`과 프리셋 24의 시간 흔들림. CI 118 passed는 이 원인을 설명하지 않는다.
 
 ## 다음 작업
 
 다음 기능 작업은 시작하지 않는다.
 
-- PR #4를 병합하지 않는다. 안정화 GO가 아니고, Actions 결과도 아직 없다.
+- PR #4를 병합하지 않는다. CI 테스트 잡은 통과했으나 로컬 필수 테스트가 실패했고 안정화 GO가 아니다.
 - PR #5는 별도 검토로 둔다.
 - `pull_request` 트리거를 켜지 않는다.
 - 1.8초 한계를 늘리거나 `timed out`을 잘림으로 바꿔 실패를 지우지 않는다.
 - 정식 릴리스 판단은 따로 유지한다. `LICENSE`가 생기고 데스크톱 차단 항목이 실행되기 전에는 릴리스 NO-GO다.
-- Actions가 끝나면 실행 주소와 테스트 잡의 Chromium 설치 여부만 이 문서에 추가한다.
+- Actions 결과는 위에 적었다. 새 기능 작업으로 이어가지 않는다.
