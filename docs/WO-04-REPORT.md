@@ -6,7 +6,9 @@
 
 작업 브랜치: `feat/wo04-browser-extraction`
 
-구현 커밋: 이 보고서를 저장하는 커밋의 부모. PR 주소는 PR을 만든 뒤 이 문서에 적는다.
+구현 커밋: `8323f80c3357d0c83a7a69c491774aed512d398f`
+
+PR: https://github.com/scarlel96-design/Universal-Media-Downloader/pull/4
 
 WO-00E: BLOCKED. 유지한다.
 
