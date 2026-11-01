@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
 
 from umd.download.engine import DownloadEngine, DownloadItem, ItemEvent
 from umd.download.schedule import EngineConfig
-from umd.extract.fetch import fetch_text
-from umd.extract.html_images import extract_images
 from umd.storage.database import Library
 
 
@@ -19,22 +19,35 @@ class ExtractWorker(QObject):
     finished = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, network_mode: str = "local") -> None:
         super().__init__()
         self._url = url
+        self._mode = network_mode if network_mode in {"local", "public"} else "local"
 
     @Slot()
     def run(self) -> None:
         try:
-            final, html = fetch_text(self._url)
-            candidates = extract_images(html, final)
-            payload = json.dumps(
-                {"pageUrl": final, "items": [item.as_dict() for item in candidates]},
-                ensure_ascii=False,
-            )
-            self.finished.emit(payload)
+            from umd.extract.router import extract_page
+
+            result = extract_page(self._url, network_mode=self._mode)
+            self.finished.emit(json.dumps(result.payload(), ensure_ascii=False))
         except Exception as exc:  # noqa: BLE001 — shown in the shell toast
             self.failed.emit(str(exc))
+
+
+def _split_rows(rows: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    images: list[dict] = []
+    videos: list[dict] = []
+    galleries: list[dict] = []
+    for row in rows:
+        delivery = str(row.get("delivery") or "")
+        if delivery == "yt-dlp" or (row.get("kind") == "video" and delivery != "http"):
+            videos.append(row)
+        elif delivery == "gallery-dl":
+            galleries.append(row)
+        else:
+            images.append(row)
+    return images, videos, galleries
 
 
 def _item_from_row(row: dict) -> DownloadItem:
@@ -103,6 +116,7 @@ class DownloadWorker(QObject):
         self._thread_id = 0
         self._cancel_early = False
         self._pause_early = False
+        self._video_marks: dict[str, int] = {}
 
     @Slot()
     def cancel(self) -> None:
@@ -117,6 +131,7 @@ class DownloadWorker(QObject):
 
     @Slot()
     def resume(self) -> None:
+        self._pause_early = False
         self._call(lambda engine: engine.request_resume())
 
     @Slot(str)
@@ -137,12 +152,30 @@ class DownloadWorker(QObject):
     @Slot()
     def run(self) -> None:
         self._thread_id = threading.get_ident()
+        images, videos, galleries = _split_rows(self._items)
+        try:
+            if images:
+                self._run_images(images)
+            if self._cancel_early:
+                self._cancel_rest(videos + galleries)
+            else:
+                self._run_galleries(galleries)
+                self._run_videos(videos)
+        finally:
+            self.finished.emit()
+            self._engine = None
+            loop = self._loop
+            self._loop = None
+            if loop is not None and not loop.is_closed():
+                loop.close()
+
+    def _run_images(self, rows: list[dict]) -> None:
         loop = asyncio.new_event_loop()
         self._loop = loop
         asyncio.set_event_loop(loop)
         engine = DownloadEngine(
             self._directory,
-            [_item_from_row(row) for row in self._items],
+            [_item_from_row(row) for row in rows],
             self._config,
             on_event=self._on_event,
         )
@@ -154,10 +187,137 @@ class DownloadWorker(QObject):
         try:
             loop.run_until_complete(engine.run())
         finally:
-            self.finished.emit()
             self._engine = None
-            loop.close()
-            self._loop = None
+
+    def _run_galleries(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        from umd.download.gallery_job import download_with_gallery
+
+        seen: set[str] = set()
+        for row in rows:
+            if self._cancel_early:
+                self._emit_row(row, status="취소", terminal=True)
+                continue
+            page = str(row.get("mediaReference") or row.get("pageUrl") or "")
+            if not page or page in seen:
+                self._emit_row(row, status="완료", note="같은 파일을 다시 저장하지 않습니다", terminal=True)
+                continue
+            seen.add(page)
+            try:
+                paths = download_with_gallery(page, Path(self._directory))
+            except Exception as exc:  # noqa: BLE001 — surfaced as a download error
+                self._emit_row(row, status="실패", error=str(exc)[:300], terminal=True)
+                continue
+            if not paths:
+                self._emit_row(row, status="실패", error="저장한 파일이 없습니다", terminal=True)
+                continue
+            path = paths[0]
+            size = path.stat().st_size
+            self._emit_row(
+                row,
+                status="완료",
+                path=str(path),
+                size=size,
+                downloaded=size,
+                total=size,
+                terminal=True,
+            )
+
+    def _run_videos(self, rows: list[dict]) -> None:
+        pending = list(rows)
+        while pending:
+            if self._cancel_early:
+                self._cancel_rest(pending)
+                return
+            if self._pause_early:
+                time.sleep(0.05)
+                continue
+            row = pending.pop(0)
+            if self._one_video(row) == "pause":
+                pending.insert(0, row)
+
+    def _one_video(self, row: dict) -> str:
+        from umd.download.video_job import TransferStop, download_video
+
+        page = str(row.get("mediaReference") or row.get("pageUrl") or row.get("fetchUrl") or "")
+        page = page.split("#", 1)[0]
+        self._emit_row(row, status="다운로드 중")
+
+        def should_stop() -> str:
+            if self._cancel_early:
+                return "cancel"
+            if self._pause_early:
+                return "pause"
+            return ""
+
+        def on_progress(downloaded: int, total: int) -> None:
+            self._emit_row(row, status="다운로드 중", downloaded=downloaded, total=total)
+
+        try:
+            path, size = download_video(
+                page,
+                Path(self._directory),
+                format_id=str(row.get("formatId") or ""),
+                should_stop=should_stop,
+                on_progress=on_progress,
+            )
+        except TransferStop as exc:
+            if exc.reason == "pause":
+                self._emit_row(row, status="일시정지", checkpoint=True)
+                return "pause"
+            self._emit_row(row, status="취소", terminal=True)
+            return "cancel"
+        except Exception as exc:  # noqa: BLE001 — download failure, not an extractor failure
+            self._emit_row(row, status="실패", error=str(exc)[:300], terminal=True)
+            return "fail"
+        self._emit_row(
+            row,
+            status="완료",
+            path=str(path),
+            size=size,
+            downloaded=size,
+            total=size if size > 0 else -1,
+            terminal=True,
+        )
+        return "done"
+
+    def _cancel_rest(self, rows: list[dict]) -> None:
+        for row in rows:
+            self._emit_row(row, status="취소", terminal=True)
+
+    def _emit_row(
+        self,
+        row: dict,
+        *,
+        status: str,
+        downloaded: int = 0,
+        total: int = -1,
+        path: str = "",
+        size: int = 0,
+        error: str = "",
+        note: str = "",
+        terminal: bool = False,
+        checkpoint: bool = False,
+    ) -> None:
+        item_id = str(row.get("itemId") or "")
+        mark = total >= 0 and downloaded > 0 and downloaded - self._video_marks.get(item_id, 0) >= 256 * 1024
+        if mark:
+            self._video_marks[item_id] = downloaded
+        event = ItemEvent(
+            item_id=item_id,
+            status=status,
+            path=path,
+            size=size,
+            downloaded=downloaded,
+            total=total,
+            error="" if status == "완료" else error,
+            note=note,
+            terminal=terminal,
+            checkpoint=checkpoint or terminal or mark,
+            priority=int(row.get("priority") or 0),
+        )
+        self._on_event(event)
 
     def _on_event(self, event: ItemEvent) -> None:
         event.py_thread = self._thread_id or threading.get_ident()

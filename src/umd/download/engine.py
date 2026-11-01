@@ -21,8 +21,9 @@ from uuid import uuid4
 import httpx
 
 from umd.download.images import _allocate, _filename, sniff_image
+from umd.download.pin import PinnedBackend, empty_pins
 from umd.download.schedule import RETRYABLE_STATUS, EngineConfig, HostBook, SlotGate, retry_delay
-from umd.netpolicy import is_allowed_url, strip_userinfo
+from umd.netpolicy import USER_AGENT, assess_public_url, is_allowed_url, strip_userinfo
 
 _PERMANENT = "permanent"
 _RETRY = "retry"
@@ -173,6 +174,7 @@ class DownloadEngine:
         self._resume = asyncio.Event()
         self._resume.set()
         self._client: httpx.AsyncClient | None = None
+        self._pins = empty_pins()
         self._tasks: dict[str, asyncio.Task[str]] = {}
         self._last_emit: dict[str, float] = {}
         self._persisted_at: dict[str, int] = {}
@@ -227,17 +229,35 @@ class DownloadEngine:
             return
         global_limit, _per_host = self.config.limits()
         pool = max(24, global_limit)
-        timeout = httpx.Timeout(self.config.timeout)
-        async with httpx.AsyncClient(
-            follow_redirects=False,
-            timeout=timeout,
-            limits=httpx.Limits(max_connections=pool, max_keepalive_connections=pool),
-            headers={
-                "User-Agent": "UniversalMediaDownloader/0.1",
-                "Accept-Encoding": "identity",
-            },
-            trust_env=False,
-        ) as client:
+        public = self.config.network_mode == "public"
+        timeout = (
+            httpx.Timeout(self.config.timeout, connect=min(10.0, self.config.timeout))
+            if public
+            else httpx.Timeout(self.config.timeout)
+        )
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept-Encoding": "identity",
+        }
+        limits = httpx.Limits(
+            max_connections=pool,
+            max_keepalive_connections=0 if public else pool,
+        )
+        client_kwargs: dict = {
+            "follow_redirects": False,
+            "timeout": timeout,
+            "headers": headers,
+            "trust_env": False,
+        }
+        if self.config.transport is not None:
+            client_kwargs["transport"] = self.config.transport
+        elif public:
+            transport = httpx.AsyncHTTPTransport(trust_env=False, retries=0, limits=limits)
+            transport._pool._network_backend = PinnedBackend(transport._pool._network_backend, self._pins)
+            client_kwargs["transport"] = transport
+        else:
+            client_kwargs["limits"] = limits
+        async with httpx.AsyncClient(**client_kwargs) as client:
             self._client = client
             try:
                 await self._schedule()
@@ -400,10 +420,25 @@ class DownloadEngine:
             return _PAUSED
         return None
 
+    def _admit(self, url: str, *, redirect: bool) -> tuple[str | None, str]:
+        if self.config.network_mode == "public":
+            decision = assess_public_url(url, resolver=self.config.resolver)
+            if not decision.allowed:
+                message = decision.message or "허용되지 않은 주소입니다"
+                if redirect:
+                    message = f"리다이렉트 주소가 허용되지 않습니다: {message}"
+                return None, message
+            self._pins.remember(decision.host, decision.port, decision.pin)
+            return decision.safe_url, ""
+        if not is_allowed_url(url):
+            message = "리다이렉트 주소가 허용되지 않습니다" if redirect else "허용되지 않은 주소입니다"
+            return None, message
+        return strip_userinfo(url), ""
+
     async def _once(self, item: DownloadItem, host: str) -> _Outcome:
-        if not is_allowed_url(item.url):
-            return _Outcome(_PERMANENT, error="허용되지 않은 주소입니다")
-        url = strip_userinfo(item.url)
+        url, error = self._admit(item.url, redirect=False)
+        if url is None:
+            return _Outcome(_PERMANENT, error=error)
         if urlsplit(url).scheme == "file":
             return self._save_file_url(item, url)
         try:
@@ -436,6 +471,10 @@ class DownloadEngine:
             status = response.status_code
             if status in {301, 302, 303, 307, 308}:
                 return await self._redirect(item, response, host, depth)
+            if self.config.network_mode == "public" and status in {401, 403}:
+                if status == 401:
+                    return _Outcome(_PERMANENT, error="인증이 필요합니다 (HTTP 401)", http_status=401)
+                return _Outcome(_PERMANENT, error="접근이 거부되었습니다 (HTTP 403)", http_status=403)
             if status in RETRYABLE_STATUS:
                 delay = retry_delay(
                     max(1, item.retry_count + 1),
@@ -493,11 +532,13 @@ class DownloadEngine:
         if depth >= 3 or not location:
             return _Outcome(_PERMANENT, error="리다이렉트 주소가 허용되지 않습니다", http_status=status)
         target = urljoin(current, location)
-        if not is_allowed_url(target):
-            return _Outcome(_PERMANENT, error="리다이렉트 주소가 허용되지 않습니다", http_status=status)
-        safe = strip_userinfo(target)
-        if urlsplit(safe).scheme == "file":
-            return _Outcome(_PERMANENT, error="리다이렉트 주소가 허용되지 않습니다", http_status=status)
+        safe, error = self._admit(target, redirect=True)
+        if safe is None or urlsplit(safe).scheme == "file":
+            return _Outcome(
+                _PERMANENT,
+                error=error or "리다이렉트 주소가 허용되지 않습니다",
+                http_status=status,
+            )
         return await self._http(item, safe, _host_of(safe), depth + 1)
 
     async def _consume(

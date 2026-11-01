@@ -1,8 +1,8 @@
 """SQLite library for local media jobs.
 
-Schema version 2. Version 1 databases gain columns and keep every row.
-Writes take one lock so the download thread and the UI thread can share
-the connection. The UI model is still updated only on the UI thread.
+Schema version 3. Version 1 and version 2 databases gain columns and keep
+every row. Writes take one lock so the download thread and the UI thread
+can share the connection. The UI model is still updated only on the UI thread.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from zlib import crc32
 
 from umd.download.images import sniff_image
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _JOBS = """
 CREATE TABLE jobs (
@@ -55,7 +55,18 @@ CREATE TABLE media_items (
     priority INTEGER NOT NULL DEFAULT 0,
     part_path TEXT NOT NULL DEFAULT '',
     last_progress_at TEXT,
-    note TEXT NOT NULL DEFAULT ''
+    note TEXT NOT NULL DEFAULT '',
+    media_type TEXT NOT NULL DEFAULT 'image',
+    extractor_id TEXT NOT NULL DEFAULT '',
+    extractor_version TEXT NOT NULL DEFAULT '',
+    media_reference TEXT NOT NULL DEFAULT '',
+    thumbnail_url TEXT NOT NULL DEFAULT '',
+    original_url TEXT NOT NULL DEFAULT '',
+    width INTEGER,
+    height INTEGER,
+    duration REAL,
+    format TEXT NOT NULL DEFAULT '',
+    subtitles TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -84,6 +95,20 @@ _V2_COLUMNS = (
     ("note", "TEXT NOT NULL DEFAULT ''"),
 )
 
+_V3_COLUMNS = (
+    ("media_type", "TEXT NOT NULL DEFAULT 'image'"),
+    ("extractor_id", "TEXT NOT NULL DEFAULT ''"),
+    ("extractor_version", "TEXT NOT NULL DEFAULT ''"),
+    ("media_reference", "TEXT NOT NULL DEFAULT ''"),
+    ("thumbnail_url", "TEXT NOT NULL DEFAULT ''"),
+    ("original_url", "TEXT NOT NULL DEFAULT ''"),
+    ("width", "INTEGER"),
+    ("height", "INTEGER"),
+    ("duration", "REAL"),
+    ("format", "TEXT NOT NULL DEFAULT ''"),
+    ("subtitles", "TEXT NOT NULL DEFAULT ''"),
+)
+
 _TRANSFER = {
     "path": "saved_path",
     "size": "byte_size",
@@ -98,6 +123,17 @@ _TRANSFER = {
     "priority": "priority",
     "part_path": "part_path",
     "note": "note",
+    "format": "format",
+    "media_type": "media_type",
+    "extractor_id": "extractor_id",
+    "extractor_version": "extractor_version",
+    "media_reference": "media_reference",
+    "thumbnail_url": "thumbnail_url",
+    "original_url": "original_url",
+    "width": "width",
+    "height": "height",
+    "duration": "duration",
+    "subtitles": "subtitles",
 }
 
 
@@ -107,6 +143,15 @@ def _now() -> str:
 
 def media_hue(url: str) -> int:
     return crc32(url.encode("utf-8")) % 360
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class Library:
@@ -150,9 +195,9 @@ class Library:
             self._conn.commit()
         else:
             version = int(row["version"])
-            if version == 1:
-                self._migrate_from_v1()
-            elif version != SCHEMA_VERSION:
+            if version < SCHEMA_VERSION:
+                self._migrate(version)
+            elif version > SCHEMA_VERSION:
                 raise RuntimeError(f"지원하지 않는 데이터베이스 버전입니다: {version}")
             else:
                 self._conn.execute(_HOSTS)
@@ -163,12 +208,27 @@ class Library:
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
         return {str(row["name"]) for row in rows}
 
-    def _migrate_from_v1(self) -> None:
+    def _migrate(self, version: int) -> None:
         existing = self._column_names("media_items")
-        for name, declaration in _V2_COLUMNS:
-            if name not in existing:
-                self._conn.execute(f"ALTER TABLE media_items ADD COLUMN {name} {declaration}")
-        self._conn.execute(_HOSTS)
+        if version < 2:
+            for name, declaration in _V2_COLUMNS:
+                if name not in existing:
+                    self._conn.execute(f"ALTER TABLE media_items ADD COLUMN {name} {declaration}")
+            self._conn.execute(_HOSTS)
+            existing = self._column_names("media_items")
+        if version < 3:
+            for name, declaration in _V3_COLUMNS:
+                if name not in existing:
+                    self._conn.execute(f"ALTER TABLE media_items ADD COLUMN {name} {declaration}")
+            self._conn.execute(
+                "UPDATE media_items SET original_url = media_url WHERE original_url = ''"
+            )
+            self._conn.execute(
+                "UPDATE media_items SET media_reference = media_url WHERE media_reference = ''"
+            )
+            self._conn.execute(
+                "UPDATE media_items SET media_type = 'image' WHERE media_type = ''"
+            )
         self._conn.execute("UPDATE schema_meta SET version = ?", (SCHEMA_VERSION,))
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
@@ -184,13 +244,23 @@ class Library:
             for row in rows:
                 item_id = uuid4().hex
                 row["itemId"] = item_id
+                width = _optional_int(row.get("width"))
+                height = _optional_int(row.get("height"))
+                duration = row.get("duration")
+                duration_value = float(duration) if isinstance(duration, (int, float)) and duration else None
+                filesize = _optional_int(row.get("filesize"))
                 self._conn.execute(
                     """
                     INSERT INTO media_items (
                         id, job_id, page_url, media_url, title, classification, reasons,
                         selected, user_override, download_status, saved_path, byte_size,
-                        error, created_at, completed_at, priority
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, '', ?, NULL, ?)
+                        error, created_at, completed_at, priority, total_size,
+                        media_type, extractor_id, extractor_version, media_reference,
+                        thumbnail_url, original_url, width, height, duration, format, subtitles
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, '', ?, NULL, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
                     """,
                     (
                         item_id,
@@ -205,6 +275,18 @@ class Library:
                         row.get("status") or "대기",
                         created,
                         int(row.get("priority") or 0),
+                        int(filesize or 0),
+                        str(row.get("mediaType") or row.get("kind") or "image"),
+                        str(row.get("extractorId") or ""),
+                        str(row.get("extractorVersion") or ""),
+                        str(row.get("mediaReference") or row.get("mediaUrl") or ""),
+                        str(row.get("thumbnailUrl") or ""),
+                        str(row.get("originalUrl") or row.get("mediaUrl") or ""),
+                        width,
+                        height,
+                        duration_value,
+                        str(row.get("format") or ""),
+                        str(row.get("subtitles") or ""),
                     ),
                 )
             self._conn.commit()
@@ -345,18 +427,29 @@ class Library:
             else:
                 progress = -1.0
             capable = item.get("resume_capable")
+            kind = str(item.get("media_type") or "image")
+            if kind not in {"image", "video"}:
+                kind = "image"
+            original = str(item.get("original_url") or item["media_url"])
+            delivery = "yt-dlp" if kind == "video" else "http"
+            if delivery == "http" and str(item.get("extractor_id") or "") == "gallery-dl":
+                suffix = original.lower().split("?", 1)[0]
+                if not suffix.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                    delivery = "gallery-dl"
+            thumb = str(item.get("thumbnail_url") or "")
+            filesize = int(item.get("total_size") or 0) or None
             rebuilt.append(
                 {
                     "title": item["title"],
-                    "kind": "image",
+                    "kind": kind,
                     "selected": bool(item["selected"]),
-                    "hue": media_hue(item["media_url"]),
-                    "previewUrl": item["media_url"],
+                    "hue": media_hue(original or item["media_url"]),
+                    "previewUrl": thumb or original,
                     "classification": item["classification"],
                     "reasons": item["reasons"],
                     "status": item["download_status"],
-                    "fetchUrl": item["media_url"],
-                    "mediaUrl": item["media_url"],
+                    "fetchUrl": original,
+                    "mediaUrl": original,
                     "pageUrl": item["page_url"],
                     "override": item["user_override"] or "",
                     "itemId": item["id"],
@@ -373,6 +466,21 @@ class Library:
                     "retryCount": int(item.get("retry_count") or 0),
                     "priority": int(item.get("priority") or 0),
                     "note": item.get("note") or "",
+                    "mediaType": kind,
+                    "extractorId": item.get("extractor_id") or "",
+                    "extractorVersion": item.get("extractor_version") or "",
+                    "mediaReference": item.get("media_reference") or original,
+                    "thumbnailUrl": thumb,
+                    "originalUrl": original,
+                    "width": item.get("width"),
+                    "height": item.get("height"),
+                    "duration": item.get("duration"),
+                    "format": item.get("format") or "",
+                    "formatId": "",
+                    "formats": [],
+                    "filesize": filesize,
+                    "delivery": delivery,
+                    "subtitles": item.get("subtitles") or "",
                 }
             )
         return rebuilt

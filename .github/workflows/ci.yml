@@ -1,0 +1,53 @@
+name: ci
+
+# Manual only. Pull requests do not start this workflow until that is approved.
+# Standard GitHub-hosted runners are free for this public repository.
+# Keep runs-on at windows-latest. Billed runner sizes are out of scope.
+
+on:
+  workflow_dispatch:
+    inputs:
+      load:
+        description: Also run the 5000-image local load test
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      QT_QUICK_CONTROLS_STYLE: Basic
+      QSG_RHI_BACKEND: software
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+      - name: Import
+        run: python -c "import umd, umd.netpolicy, umd.extract.router, umd.download.engine"
+      - name: Regression and WO-03 tests
+        run: python -m pytest --ignore=tests/unit/test_wo02_load.py --ignore=tests/live
+
+  load:
+    if: ${{ inputs.load }}
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      QT_QUICK_CONTROLS_STYLE: Basic
+      QSG_RHI_BACKEND: software
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+      - name: 5000-image load test
+        run: python -m pytest tests/unit/test_wo02_load.py

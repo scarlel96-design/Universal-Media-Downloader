@@ -101,6 +101,54 @@ Rectangle {
             elide: Text.ElideRight
         }
         Text {
+            visible: shell.detailMeta.length > 0
+            width: parent.width
+            text: shell.detailMeta
+            color: ink.muted
+            font.pixelSize: 11
+            font.family: "Segoe UI Variable Text"
+            wrapMode: Text.WordWrap
+        }
+        Text {
+            visible: shell.detailError.length > 0
+            width: parent.width
+            text: shell.detailError
+            color: ink.muted
+            font.pixelSize: 11
+            font.family: "Segoe UI Variable Text"
+            wrapMode: Text.WordWrap
+        }
+        Column {
+            visible: shell.formatChoices.length > 0
+            width: parent.width
+            spacing: 4
+            Text {
+                text: "형식 선택"
+                color: ink.muted
+                font.pixelSize: 11
+                font.family: "Segoe UI Variable Text"
+            }
+            Repeater {
+                model: shell.formatChoices
+                delegate: Text {
+                    required property int index
+                    required property string modelData
+                    readonly property var parts: modelData.split("|")
+                    text: (parts[2] === "1" ? "● " : "○ ") + parts[1]
+                    color: parts[2] === "1" ? ink.title : ink.muted
+                    font.pixelSize: 11
+                    font.family: "Segoe UI Variable Text"
+                    width: 258
+                    elide: Text.ElideRight
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: shell.selectFormat(parts[0])
+                    }
+                }
+            }
+        }
+        Text {
             visible: shell.detailReasons.length > 0
             text: shell.detailReasons
             color: ink.muted

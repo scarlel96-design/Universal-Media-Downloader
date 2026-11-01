@@ -18,7 +18,7 @@ from urllib.parse import unquote, urlsplit
 from urllib.request import Request, url2pathname, urlopen
 from uuid import uuid4
 
-from umd.netpolicy import is_allowed_url
+from umd.netpolicy import USER_AGENT, is_allowed_url
 
 _CHUNK = 64 * 1024
 _EXT = {"png": ".png", "jpeg": ".jpg", "gif": ".gif", "webp": ".webp"}
@@ -116,7 +116,7 @@ def _transfer(
     try:
         if urlsplit(url).scheme == "file":
             return _save_bytes(Path(url2pathname(urlsplit(url).path)).read_bytes(), url, folder, part, names, cancel)
-        request = Request(url, headers={"User-Agent": "UniversalMediaDownloader/0.1"})
+        request = Request(url, headers={"User-Agent": USER_AGENT})
         with urlopen(request, timeout=timeout) as response:
             final = response.geturl()
             if not is_allowed_url(final):
