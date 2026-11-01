@@ -1,0 +1,30 @@
+{
+  "content": [
+    {"file": "photos/coast.png", "title": "Coast", "reasons": ["본문 컨테이너"]},
+    {"file": "photos/lake-1200.jpg", "title": "Lake", "reasons": ["srcset에서 가장 넓은"]},
+    {"file": "photos/lazy.png", "title": "Lazy", "reasons": ["data-src"]},
+    {"file": "photos/panel.png", "title": "Panel", "reasons": ["data-original", "작지만"]},
+    {"file": "photos/dot.png", "title": "Dot", "reasons": ["작지만"]},
+    {"file": "photos/original.png", "title": "Original", "reasons": ["원본 파일"]},
+    {"file": "photos/pic-800.webp", "title": "Picture", "reasons": ["picture source"]}
+  ],
+  "excluded": [
+    {"file": "photos/logo.png", "title": "Logo", "reasons": ["로고"]},
+    {"file": "photos/nav-icon.png", "title": "Icon", "reasons": ["아이콘"]},
+    {"file": "photos/related.png", "title": "Related", "reasons": ["추천"]},
+    {"file": "photos/ad.png", "title": "Sponsor", "reasons": ["광고"]},
+    {"file": "photos/avatar.png", "title": "Avatar", "reasons": ["프로필"]},
+    {"file": "photos/tracker.gif", "title": "Tracker", "reasons": ["추적"]}
+  ],
+  "uncertain": [
+    {"file": "photos/widget.png", "title": "Widget", "reasons": ["단서가 없음"]},
+    {"file": "photos/tiny.png", "title": "Tiny", "reasons": ["단서가 없음"]}
+  ],
+  "absent": [
+    "photos/thumb.png",
+    "photos/lake-400.jpg",
+    "photos/lazy-placeholder.png",
+    "photos/pic-200.webp",
+    "photos/pic-fallback.png"
+  ]
+}
