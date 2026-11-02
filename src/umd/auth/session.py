@@ -53,6 +53,10 @@ def request_headers(url: str, store: "SessionStore | None" = None) -> dict[str, 
     return headers
 
 
+class SessionProtectError(RuntimeError):
+    """Raised when a session jar cannot be limited to the current user."""
+
+
 class SessionStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
@@ -68,7 +72,10 @@ class SessionStore:
         safe = _state_for_host(host, state)
         (directory / "state.json").write_text(json.dumps(safe), encoding="utf-8")
         (directory / "expires").write_text(str(expires_at), encoding="ascii")
-        _restrict(directory)
+        if _restrict(directory):
+            return
+        shutil.rmtree(directory, ignore_errors=True)
+        raise SessionProtectError("세션을 보호하지 못해 저장하지 않았습니다")
 
     def load(self, host: str) -> dict | None:
         directory = self._dir(host)
@@ -201,18 +208,37 @@ def _path_matches(cookie_path: str, request_path: str) -> bool:
     return len(request_path) > len(cookie_path) and request_path[len(cookie_path)] == "/"
 
 
-def _restrict(directory: Path) -> None:
-    """Limit the jar to the current user. Failure leaves the temp file in place."""
+def _restrict(directory: Path) -> bool:
+    """Limit the jar to the current user. False means the caller must delete it."""
 
     if os.name != "nt":
-        os.chmod(directory, 0o700)
-        return
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            return False
+        return True
     user = os.environ.get("USERNAME")
     if not user:
-        return
-    subprocess.run(
+        return False
+    grant = subprocess.run(
         ["icacls", str(directory), "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F"],
         capture_output=True,
         timeout=10,
         check=False,
     )
+    if grant.returncode != 0:
+        return False
+    shown = subprocess.run(
+        ["icacls", str(directory)],
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    if shown.returncode != 0:
+        return False
+    try:
+        encoded = user.encode("mbcs")
+    except LookupError:
+        encoded = user.encode()
+    blob = shown.stdout or b""
+    return encoded in blob and b"(OI)(CI)(F)" in blob

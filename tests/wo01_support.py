@@ -11,6 +11,7 @@ import json
 import socket
 import threading
 import time
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -49,26 +50,43 @@ class FixtureServer:
         while not self._stop.is_set():
             try:
                 self._socket.settimeout(0.2)
-                connection, _address = self._socket.accept()
+                connection, address = self._socket.accept()
             except TimeoutError:
                 continue
             except OSError:
                 return
-            threading.Thread(target=self._client, args=(connection,), daemon=True).start()
+            threading.Thread(target=self._client, args=(connection, address), daemon=True).start()
 
-    def _client(self, connection: socket.socket) -> None:
+    def _client(self, connection: socket.socket, address: tuple[str, int]) -> None:
         try:
             connection.settimeout(5)
+            peeked = b""
+            while b"\r\n\r\n" not in peeked and len(peeked) < 16384:
+                try:
+                    peeked = connection.recv(16384, socket.MSG_PEEK)
+                except TimeoutError:
+                    return
+                if not peeked:
+                    return
+                if b"\r\n\r\n" not in peeked:
+                    time.sleep(0.01)
+            line = peeked.split(b"\r\n", 1)[0].decode("latin1", errors="replace")
+            parts = line.split(" ")
+            path = unquote(urlsplit(parts[1]).path) if len(parts) > 1 else "/"
+            status, content_type, body, delay, declared = _route(path)
+            if declared is not None and declared > len(body):
+                # shutdown(SHUT_WR) then a blocking recv returns 0 at once on
+                # this host. Closing after that recv drops the EOF urllib is
+                # still waiting on, so the short body waits out its timeout.
+                # The stdlib handler finishes the socket without that recv.
+                _TruncatedHandler.respond(connection, address, status, content_type, body, declared)
+                return
             raw = b""
             while b"\r\n\r\n" not in raw and len(raw) < 16384:
                 chunk = connection.recv(4096)
                 if not chunk:
                     return
                 raw += chunk
-            line = raw.split(b"\r\n", 1)[0].decode("latin1", errors="replace")
-            parts = line.split(" ")
-            path = unquote(urlsplit(parts[1]).path) if len(parts) > 1 else "/"
-            status, content_type, body, delay, declared = _route(path)
             if delay:
                 time.sleep(delay)
             length = len(body) if declared is None else declared
@@ -103,6 +121,41 @@ class FixtureServer:
 
     def server_close(self) -> None:
         self.shutdown()
+
+
+class _TruncatedHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def __init__(self, request, client_address, server, payload: tuple[int, str, bytes, int]):
+        self._payload = payload
+        super().__init__(request, client_address, server)
+
+    def do_GET(self) -> None:
+        status, content_type, body, declared = self._payload
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(declared))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+    @staticmethod
+    def respond(
+        connection: socket.socket,
+        address: tuple[str, int],
+        status: int,
+        content_type: str,
+        body: bytes,
+        declared: int,
+    ) -> None:
+        _TruncatedHandler(connection, address, None, (status, content_type, body, declared))
+        try:
+            connection.shutdown(socket.SHUT_WR)
+        except OSError:
+            return
 
 
 def _file_under_posts(path: str) -> Path | None:

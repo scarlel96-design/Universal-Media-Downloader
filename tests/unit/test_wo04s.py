@@ -9,7 +9,7 @@ import threading
 import time
 from pathlib import Path
 
-from umd.auth.session import SessionStore, persistent_sessions_enabled
+from umd.auth.session import SessionProtectError, SessionStore, persistent_sessions_enabled
 from umd.download.engine import (
     _is_proactor_shutdown_10022,
     install_windows_socket_close,
@@ -92,6 +92,32 @@ def test_expired_store_is_removed_on_the_next_open(tmp_path: Path):
     again = SessionStore(root)
     assert not (root / "gone.example").exists()
     assert again.cookie_header("https://gone.example/") == ""
+
+
+def test_failed_acl_does_not_keep_the_session(tmp_path: Path, monkeypatch) -> None:
+    def refuse(*_args, **_kwargs):
+        class Result:
+            returncode = 1
+            stdout = b""
+            stderr = b"denied"
+
+        return Result()
+
+    monkeypatch.setattr("umd.auth.session.subprocess.run", refuse)
+    store = SessionStore(tmp_path / "sessions")
+    try:
+        store.save(
+            "files.example",
+            {"cookies": [{"name": "a", "value": "secret-value", "domain": "files.example"}]},
+            expires_at=time.time() + 60,
+        )
+    except SessionProtectError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("unprotected session was kept")
+    assert message == "세션을 보호하지 못해 저장하지 않았습니다"
+    assert "secret-value" not in message
+    assert not (tmp_path / "sessions" / "files.example").exists()
 
 
 def test_proxy_cap_and_rebinding_do_not_open_extra_targets():
