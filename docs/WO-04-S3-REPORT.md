@@ -16,6 +16,8 @@ PR 상태: OPEN. 이 작업에서 병합하지 않았다. PR #5도 병합하지 
 
 기준 HEAD: `ca20defff8804d2c4a1e22de6658a88114b45b63`
 
+구현 커밋: `e7b6df3a805181840366c350cf7d0fd2b03b4993`
+
 환경: 로컬 Windows, Python 3.12.10, pytest 9.2.0. 저장소 가상환경. `QT_QPA_PLATFORM=offscreen`. CI 결과와 로컬 결과를 같은 PASS로 적지 않는다.
 
 안정화 판정: 미충족. GO가 아니다.
@@ -40,7 +42,7 @@ PR 상태: OPEN. 이 작업에서 병합하지 않았다. PR #5도 병합하지 
 | 5,000장 부하 테스트 | PASS. 로컬 1회. |
 | 바이트 무결성 불일치 0 | PASS. `integrity_mismatches` 0. |
 | 인증 정보 보호 | 유지. 세션 ACL 실패 시 삭제 동작은 바꾸지 않았다. 전체 단위 테스트에 그 검사가 포함된다. |
-| GitHub Actions 테스트 잡 | 이 보고서를 푸시한 뒤 수동 실행한다. 이 시점에는 NOT RUN. |
+| GitHub Actions 테스트 잡 | PASS. 테스트 잡만. 부하 잡은 건너뜀. 로컬 EOF 4실패와 별개다. |
 | 해결되지 않은 필수 FAIL 없음 | FAIL. EOF 30회가 26/30이다. |
 
 ## 수정 파일
@@ -185,9 +187,17 @@ PR 상태: OPEN. 이 작업에서 병합하지 않았다. PR #5도 병합하지 
 
 ## GitHub Actions
 
-이 문서를 쓰는 시점에는 이번 커밋의 수동 실행이 없다. S2 실행 `41368994899`의 headSha는 `aabbffef49208225b255c4b14f5f0bf1d42c5f10`이고, 그 기록 커밋 `ca20def` 자체를 CI가 실행한 것은 아니다. 그 결과를 이번 통과로 세지 않는다.
+수동 실행만 했다. `inputs.load`는 주지 않았다. `pull_request`는 켜지 않았다.
 
-푸시 뒤 `workflow_dispatch`만 실행한다. `inputs.load`는 주지 않는다. `pull_request`는 켜지 않는다. 실행 SHA가 푸시한 커밋과 같고 로그에 Playwright Chromium 설치와 pytest 결과가 있을 때만 URL을 적는다. CI PASS는 로컬 EOF 4실패를 지우지 않는다.
+실행: https://github.com/scarlel96-design/Universal-Media-Downloader/actions/runs/41379332972
+
+이벤트: `workflow_dispatch`
+
+headSha: `e7b6df3a805181840366c350cf7d0fd2b03b4993`
+
+이 SHA는 구현 커밋과 같다. 테스트 잡은 성공했다. Install 로그에 `python -m playwright install chromium`이 있고, Chrome for Testing 156.0.8078.4, Playwright chromium v1248이 받아졌다. Regression 단계 로그의 pytest 결과는 `123 passed in 55.44s`다. 부하 잡은 skipped다.
+
+이 CI PASS는 로컬 EOF 26/30을 지우지 않는다. 브라우저가 설치된 사실만으로 통과를 적지 않았다. S2 실행 `41368994899`의 headSha `aabbffe`도 이번 결과로 세지 않는다.
 
 ## 미해결
 
@@ -198,7 +208,7 @@ PR 상태: OPEN. 이 작업에서 병합하지 않았다. PR #5도 병합하지 
 | lazy.html 30회 | 수정 후 PASS. 수정 전 6실패는 유지. |
 | 전체 단위 3회 연속 | 수정 후 PASS. 수정 전은 연속이 아님. |
 | 5,000장 | PASS. |
-| GitHub Actions 이번 SHA | NOT RUN. |
+| GitHub Actions 이번 SHA | PASS. 테스트 잡 123 passed, 55.44초. 부하 잡은 skipped. |
 | 공개 인터넷에서만 보이는 JavaScript 미디어 | NOT RUN. |
 | Windows 실환경 데스크톱 UI | NOT RUN. 출시 차단. |
 | 프로젝트 LICENSE | 없음. 파일을 만들지 않음. 출시 차단. |
@@ -211,7 +221,7 @@ PR 상태: OPEN. 이 작업에서 병합하지 않았다. PR #5도 병합하지 
 
 ## 병합과 릴리스
 
-PR #4는 병합하지 않는다. EOF 30회가 필수 조건이고 4회가 실패로 남아 있다. Actions 결과도 아직 없다. PR #5는 열린 채로 둔다. 다음 기능 개발은 시작하지 않는다.
+PR #4는 병합하지 않는다. EOF 30회가 필수 조건이고 4회가 실패로 남아 있다. Actions 테스트 잡이 통과해도 그 로컬 실패는 남는다. PR #5는 열린 채로 둔다. 다음 기능 개발은 시작하지 않는다.
 
 기능 안정화 GO: NO-GO.
 
