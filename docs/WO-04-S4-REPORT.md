@@ -16,11 +16,13 @@ PR 상태: OPEN. 이 작업에서 병합하지 않았다. PR #5도 병합하지 
 
 기준 HEAD: `e555b9ba4d38d917c54e0ea4cb6b4b43dcbf2e40`
 
+구현 커밋: `58091cff931d0c079a995319c65f23173e5876b0`
+
 환경: 로컬 Windows, Python 3.12.10, pytest 9.2.0. 저장소 밖 가상환경에 `PYTHONPATH=src`. `QT_QPA_PLATFORM=offscreen`. 반복은 프로세스마다 새로 시작했다. CI 결과와 로컬 결과를 같은 PASS로 적지 않는다.
 
-안정화 판정: 로컬 필수 항목은 통과했다. GitHub Actions 테스트 잡은 이 커밋을 푸시한 뒤 수동 실행한다. 그 로그를 보기 전에는 안정화 GO로 적지 않는다.
+안정화 판정: GO. 로컬 필수 항목과 Actions 테스트 잡이 통과했다. 모의 EOF와 영상 시험 대역은 아래와 같이 제품의 모든 경로를 뜻하지 않는다.
 
-병합 판정: 이 작업에서 병합하지 않는다. Actions 결과가 나오기 전에는 병합 가능으로 적지 않는다.
+병합 판정: 조건은 충족했다. 이 작업에서 병합하지 않았다. PR #4는 열린 상태다.
 
 정식 공개 릴리스: NO-GO. Windows 실환경 UI와 프로젝트 `LICENSE` 없음은 출시 차단이다. 기능 안정화 GO와 정식 릴리스 GO는 따로 둔다.
 
@@ -39,8 +41,8 @@ PR 상태: OPEN. 이 작업에서 병합하지 않았다. PR #5도 병합하지 
 | 애플리케이션 종료 검증 | PASS. 정상 종료, 막힌 읽기, 지연된 영상 취소 확인. `QThread.terminate`는 쓰지 않았다. |
 | 전체 단위 테스트 3회 연속 | PASS. 127 passed, 70.02초, 63.75초, 65.18초. 모두 exit 0. |
 | 5,000장 부하 테스트 | PASS. 반복 행렬 1회 exit 0. 수치 줄은 아래의 추가 실행이다. |
-| GitHub Actions 테스트 잡 | 이 보고서를 푸시한 뒤 수동 실행한다. 이 시점에는 NOT RUN. |
-| 필수 미해결 FAIL | 로컬 필수 실패는 없다. Actions는 아직 없다. |
+| GitHub Actions 테스트 잡 | PASS. 테스트 잡만. 부하 잡은 건너뜀. |
+| 필수 미해결 FAIL | 없음. |
 
 ## 테스트 구조를 바꾼 이유
 
@@ -112,7 +114,7 @@ S3의 `test_eof_short_body_reports_truncation_and_keeps_no_file`는 `_observe_eo
 
 ## 반복
 
-기준 HEAD `e555b9ba4d38d917c54e0ea4cb6b4b43dcbf2e40`에서 돌렸다. 구현 커밋의 SHA는 푸시 뒤의 기록과 다를 수 있다. 아래 횟수는 그 구현을 작업 트리에서 실행한 것이다.
+아래 횟수는 구현 커밋 `58091cf`로 커밋되기 전의 작업 트리에서 돌렸다. 그 트리가 구현 커밋이다. Actions가 실행한 SHA도 `58091cf`다. 이 기록 커밋은 CI가 실행한 커밋이 아니다.
 
 | 항목 | 결과 | 프로세스 벽시계 |
 | --- | --- | --- |
@@ -157,9 +159,17 @@ S3의 `test_eof_short_body_reports_truncation_and_keeps_no_file`는 `_observe_eo
 
 ## GitHub Actions
 
-이 문서를 쓰는 시점에는 이번 커밋의 수동 실행이 없다. S3 실행 `41379332972`의 headSha는 `e7b6df3a805181840366c350cf7d0fd2b03b4993`이다. 그 결과를 이번 통과로 세지 않는다.
+수동 실행만 했다. `inputs.load`는 주지 않았다. `pull_request`는 켜지 않았다.
 
-푸시 뒤 `workflow_dispatch`만 실행한다. `inputs.load`는 주지 않는다. `pull_request`는 켜지 않는다. 실행 SHA가 푸시한 커밋과 같고 로그에 Playwright Chromium 설치와 pytest 결과가 있을 때만 URL을 적는다.
+실행: https://github.com/scarlel96-design/Universal-Media-Downloader/actions/runs/41383881435
+
+이벤트: `workflow_dispatch`
+
+headSha: `58091cff931d0c079a995319c65f23173e5876b0`
+
+이 SHA는 구현 커밋과 같다. 테스트 잡은 성공했다. Install 로그에 `python -m playwright install chromium`이 있고, Chrome for Testing 156.0.8078.4, Playwright chromium v1248이 받아졌다. Regression 단계 로그의 pytest 결과는 `127 passed in 65.16s`다. 부하 잡은 skipped다.
+
+이 CI PASS는 로컬 반복 표를 대신하지 않는다. 브라우저가 설치된 사실만으로 통과를 적지 않았다. S3 실행 `41379332972`의 headSha `e7b6df3`도 이번 결과로 세지 않는다.
 
 ## 미해결
 
@@ -173,7 +183,7 @@ S3의 `test_eof_short_body_reports_truncation_and_keeps_no_file`는 `_observe_eo
 | lazy.html 30회 | PASS. |
 | 전체 단위 3회 | PASS. 127. |
 | 5,000장 | PASS. 수치는 두 번째 실행. |
-| GitHub Actions 이번 SHA | NOT RUN. |
+| GitHub Actions 이번 SHA | PASS. 테스트 잡 127 passed, 65.16초. 부하 잡은 skipped. |
 | 공개 인터넷에서만 보이는 JavaScript 미디어 | NOT RUN. |
 | Windows 실환경 데스크톱 UI | NOT RUN. 출시 차단. |
 | 프로젝트 LICENSE | 없음. 파일을 만들지 않음. 출시 차단. |
@@ -181,14 +191,14 @@ S3의 `test_eof_short_body_reports_truncation_and_keeps_no_file`는 `_observe_eo
 
 ## 추가 비용
 
-유료 API나 새 서비스는 쓰지 않았다. 로컬 반복, 지표를 읽기 위한 부하 테스트 추가 1회, 그리고 푸시 뒤 Windows Actions 테스트 잡 1회가 예정이다. 부하 잡은 이번 워크플로에서 켜지 않는다.
+유료 API나 새 서비스는 쓰지 않았다. 로컬 반복, 지표를 읽기 위한 부하 테스트 추가 1회, Windows Actions 테스트 잡 1회다. 부하 잡은 켜지 않았다.
 
 ## 병합과 릴리스
 
-PR #4는 병합하지 않는다. 로컬 필수 항목은 통과했다. Actions 테스트 잡 로그가 없기 때문에 병합 가능으로 닫지 않는다. PR #5는 열린 채로 둔다. 다음 기능 개발은 시작하지 않는다.
+필수 조건은 충족했다. PR #4를 병합할 수 있다. 이 작업에서는 병합하지 않았다. PR #5는 열린 채로 둔다. 다음 기능 개발은 시작하지 않는다.
 
-테스트가 통과한 것과 제품의 모든 경로가 확인된 것은 다르다. 모의 EOF는 소켓을 열지 않는다. 영상 종료 확인은 시험 대역이다.
+테스트가 통과한 것과 제품의 모든 경로가 확인된 것은 다르다. 모의 EOF는 소켓을 열지 않는다. 영상 종료 확인은 시험 대역이다. 정식 릴리스 차단은 남아 있다.
 
-기능 안정화 GO: Actions 전이라 아직 아니다.
+기능 안정화 GO: GO.
 
 정식 릴리스 GO: NO-GO.
