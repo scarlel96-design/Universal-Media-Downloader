@@ -16,7 +16,9 @@ PR 상태: OPEN. 이 작업에서 병합하지 않았다. PR #5도 병합하지 
 
 구현 커밋: `fd93f1860387f60b8989d6c5cdb4b2477811d63a`
 
-로컬 반복 실험은 이 구현을 커밋하기 전의 같은 작업 트리에서 했다. 기록 커밋은 이 SHA를 문서에 적는 차이만 있다.
+기록 커밋: `aabbffef49208225b255c4b14f5f0bf1d42c5f10`. 구현 커밋과의 차이는 이 문서에 SHA를 적은 것뿐이다.
+
+로컬 반복 실험은 구현 커밋 직전의 같은 작업 트리에서 했다.
 
 환경: 로컬 Windows, Python 3.12, 저장소 가상환경. CI 결과와 로컬 결과를 같은 PASS로 적지 않는다.
 
@@ -40,7 +42,7 @@ PR 상태: OPEN. 이 작업에서 병합하지 않았다. PR #5도 병합하지 
 | 부분 파일 정리 정상 | 부분. 통과한 `test_11` 29회는 디렉터리가 비었다. 실패 1회는 그 검사 전에 멈췄다. |
 | Windows 소켓 오류 처리 검증 | PASS. 10022 필터는 종료 콜백의 `shutdown`만 무시한다. 전송 중 10054는 오류로 남았다. 필터 코드는 이번 작업에서 바꾸지 않았다. |
 | 인증 파일 접근 권한 검증 | PASS. 권한 적용 실패 시 세션 디렉터리를 지우고 예외를 낸다. |
-| GitHub Actions 테스트 잡 PASS | NOT RUN. 이 문서를 처음 쓸 때는 아직 실행하지 않았다. |
+| GitHub Actions 테스트 잡 PASS | PASS. 테스트 잡만. 부하 잡은 실행하지 않았다. 로컬 FAIL과 별개다. |
 | 해결되지 않은 필수 FAIL 없음 | FAIL. |
 
 기능 개발 GO와 정식 릴리스 GO는 따로 둔다. 둘 다 NO-GO다.
@@ -217,9 +219,16 @@ Windows에서는 `icacls /inheritance:r /grant:r {user}:(OI)(CI)F`의 종료 코
 
 ## GitHub Actions
 
-구현 커밋 `fd93f1860387f60b8989d6c5cdb4b2477811d63a`를 푸시한 뒤 `workflow_dispatch`로 이 브랜치를 실행한다. 부하 잡은 켜지 않는다. 실행 `headSha`가 푸시한 기록 커밋과 같은지 확인한다. CI가 통과해도 로컬 필수 FAIL이 있으면 GO가 아니다.
+- 주소: https://github.com/scarlel96-design/Universal-Media-Downloader/actions/runs/41368994899
+- 이벤트: `workflow_dispatch`
+- `--ref`: `feat/wo04-browser-extraction`
+- `headSha`: `aabbffef49208225b255c4b14f5f0bf1d42c5f10`
+- 로컬 기록 커밋과 같다. 구현 커밋 `fd93f1860387f60b8989d6c5cdb4b2477811d63a`와는 이 문서의 SHA 기록만 다르다.
+- 테스트 잡: success. 로그에 `python -m playwright install chromium`이 있고, Chrome for Testing 156.0.8078.4 (playwright chromium v1248) 설치가 찍혀 있다.
+- 테스트 잡 pytest: `119 passed in 58.96s`
+- 부하 잡: skipped. `inputs.load`를 켜지 않았다.
 
-이 절의 실행 URL은 아직 NOT RUN이다. 실행이 끝나면 같은 문서에 덧붙인다.
+CI 테스트 잡 PASS는 로컬 `test_11` 1회 실패, unit-1 크래시, unit-3 `lazy.html` 실패를 지우지 않는다. CI 성공만으로 GO를 주지 않는다.
 
 ## 잔여 항목
 
@@ -231,7 +240,6 @@ FAIL:
 
 NOT RUN:
 
-- GitHub Actions. 첫 기록 시점.
 - `test_11` 실패 1회의 디렉터리 목록.
 - 다른 프로세스의 CPU 부하 계수.
 - unit-1에서 죽은 테스트의 이름.
