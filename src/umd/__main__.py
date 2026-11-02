@@ -27,7 +27,7 @@ def main() -> int:
     if not engine.rootObjects():
         return 1
     def _stop_workers() -> None:
-        bundle.shell.cancelDownload()
+        bundle.shell.shutdownForQuit()
         bundle.shell.joinWorkers(None)
 
     app.aboutToQuit.connect(_stop_workers)

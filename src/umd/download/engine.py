@@ -12,6 +12,7 @@ import heapq
 import json
 import linecache
 import os
+import socket
 import sys
 import threading
 import time
@@ -220,6 +221,10 @@ class DownloadEngine:
         self._resume.set()
         for task in list(self._tasks.values()):
             task.cancel()
+        # A stalled read does not see the flag until the next chunk. Closing
+        # the live socket lets that read raise so this task can exit. This is
+        # not QThread.terminate; the worker thread returns on its own.
+        _close_live_sockets(self._client)
 
     def request_cancel_one(self, item_id: str) -> None:
         self._cancel_ids.add(item_id)
@@ -465,8 +470,12 @@ class DownloadEngine:
         try:
             return await self._http(item, url, host, depth=0)
         except httpx.TimeoutException:
+            if self._stopped(item.item_id):
+                return self._cancelled(item)
             return _Outcome(_RETRY, delay=self._backoff(item), error="시간이 초과되었습니다")
         except httpx.TransportError as exc:
+            if self._stopped(item.item_id):
+                return self._cancelled(item)
             return _Outcome(_RETRY, delay=self._backoff(item), error=_safe_transport(exc))
 
     def _backoff(self, item: DownloadItem) -> float:
@@ -629,6 +638,9 @@ class DownloadEngine:
                         item.last_modified = modified
                     self._maybe_progress(item, response.status_code)
         except httpx.TransportError:
+            # Cancel closes the socket. That raise is not a short body.
+            if self._stopped(item.item_id):
+                return self._cancelled(item)
             self._truncate_part(part, append_at)
             item.downloaded = append_at
             return _Outcome(_RETRY, delay=self._backoff(item), error="응답이 잘렸습니다", http_status=response.status_code)
@@ -803,6 +815,14 @@ class DownloadEngine:
         item.status = status
         self._on_event(event)
 
+    def _stopped(self, item_id: str) -> bool:
+        return self._cancel_all or item_id in self._cancel_ids
+
+    def _cancelled(self, item: DownloadItem) -> _Outcome:
+        self._discard(item)
+        self._finish_cancel(item)
+        return _Outcome(_CANCEL)
+
     def _finish_cancel(self, item: DownloadItem) -> None:
         if item.status == "취소":
             return
@@ -824,6 +844,41 @@ class DownloadEngine:
                 handle.truncate(size)
         except OSError:
             pass
+
+
+def _close_live_sockets(client: object | None) -> None:
+    """Unblock reads that are waiting on a socket this client still owns."""
+
+    transport = getattr(client, "_transport", None)
+    pool = getattr(transport, "_pool", None) if transport is not None else None
+    if pool is None:
+        return
+    try:
+        connections = list(pool.connections)
+    except Exception:
+        return
+    for connection in connections:
+        inner = getattr(connection, "_connection", None)
+        stream = getattr(inner, "_network_stream", None)
+        if stream is None:
+            continue
+        try:
+            sock = stream.get_extra_info("socket")
+        except Exception:
+            continue
+        if sock is None:
+            continue
+        # asyncio wraps the socket and refuses close(). The raw socket is what
+        # the stalled read is waiting on.
+        raw = getattr(sock, "_sock", sock)
+        try:
+            raw.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            raw.close()
+        except OSError:
+            continue
 
 
 def install_windows_socket_close() -> None:

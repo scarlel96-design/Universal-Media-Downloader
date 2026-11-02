@@ -612,6 +612,7 @@ class ShellState(QObject):
         self._extract_worker: ExtractWorker | None = None
         self._download_thread: QThread | None = None
         self._download_worker: DownloadWorker | None = None
+        self._quitting = False
         model.dataChanged.connect(lambda *_: self.countsChanged.emit())
         proxy.modelReset.connect(self.countsChanged.emit)
         proxy.layoutChanged.connect(self.countsChanged.emit)
@@ -874,7 +875,10 @@ class ShellState(QObject):
         # is destroyed while it is still running. The default limit stays 5s.
         # QThread.wait() on the GUI thread cannot deliver the queued
         # thread.quit() that the worker emits, so this pumps events instead.
-        # None waits until the worker returns. Cancel does not unblock a read.
+        # None waits until the worker returns. It does not call
+        # QThread.terminate. shutdownForQuit() cancels first and closes a
+        # stalled socket so the worker can return. A video child that has
+        # not acknowledged cancel still keeps this wait alive.
         from PySide6.QtGui import QGuiApplication
 
         app = QGuiApplication.instance()
@@ -892,6 +896,22 @@ class ShellState(QObject):
             if app is not None:
                 app.processEvents()
             time.sleep(0.02)
+
+    @Slot()
+    def shutdownForQuit(self) -> None:
+        """Cancel current work and show that the window is waiting for it.
+
+        A second call does not start another job. The worker thread is left
+        running until it returns.
+        """
+
+        self._quitting = True
+        self.cancelDownload()
+        self._phase = "종료 중"
+        self._status_line = "종료를 기다리는 중"
+        self._banner = "종료를 기다리는 중"
+        self.jobPhaseChanged.emit()
+        self.notesChanged.emit()
 
     @Slot()
     def toggleTheme(self) -> None:
@@ -1154,6 +1174,9 @@ class ShellState(QObject):
 
     @Slot()
     def analyze(self) -> None:
+        if self._quitting:
+            self._notify("종료를 기다리는 중입니다.")
+            return
         if not self._url.strip():
             self._notify("분석할 URL이 없습니다. 주소 입력은 미리보기만 동작합니다.")
             return
@@ -1229,6 +1252,9 @@ class ShellState(QObject):
 
     @Slot()
     def download(self) -> None:
+        if self._quitting:
+            self._notify("종료를 기다리는 중입니다.")
+            return
         rows = [self._model.item(index) for index in range(self._model.rowCount())]
         if not any(row.get("fetchUrl") for row in rows):
             self._notify("다운로드 엔진은 연결되지 않았습니다. 파일은 저장하지 않습니다.")
@@ -1334,6 +1360,9 @@ class ShellState(QObject):
 
     @Slot()
     def resumeDownload(self) -> None:
+        if self._quitting:
+            self._notify("종료를 기다리는 중입니다.")
+            return
         if self._download_worker is None:
             return
         self._download_worker.resume()
@@ -1346,6 +1375,9 @@ class ShellState(QObject):
 
     @Slot()
     def retryFailed(self) -> None:
+        if self._quitting:
+            self._notify("종료를 기다리는 중입니다.")
+            return
         if self._download_thread is not None and self._download_thread.isRunning():
             self._notify("이미 다운로드 중입니다.")
             return

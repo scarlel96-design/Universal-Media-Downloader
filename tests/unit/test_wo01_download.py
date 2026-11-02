@@ -1,10 +1,10 @@
+import os
 import threading
 from pathlib import Path
-from urllib.error import URLError
-from urllib.request import urlopen
 
 import pytest
 
+from umd.download import images
 from umd.download.images import download_one
 from umd.storage.database import SCHEMA_VERSION, Library
 from wo01_support import EXPECTED, PHOTOS, ProbeServer, base_url, serve
@@ -82,43 +82,221 @@ def _failed_clean(result, folder: Path) -> None:
     assert list(folder.glob("*.part")) == []
 
 
-def _observe_eof_gap(url: str, sent: int) -> tuple[int, int]:
-    """Return (declared, received) for one clean short read.
+class _EofStream:
+    """One controllable body. No socket is opened.
 
-    A reset is not treated as a short read. A few attempts are allowed because
-    this host sometimes answers the same close with WinError 10054.
+    ``download_one`` still compares ``Content-Length`` with the bytes ``read``
+    returns. S3 observed EOF on a different connection from the one
+    ``download_one`` opened, and that run was 26/30. This stream is the
+    contract for a clean EOF. The real TCP close stays in the early-close test.
     """
 
-    last = "no response"
-    for _ in range(8):
-        try:
-            with urlopen(url, timeout=2) as response:
-                declared = int(response.headers["Content-Length"])
-                first = response.read(64 * 1024)
-                second = response.read(64 * 1024)
-        except URLError as exc:
-            last = str(exc.reason)
-            continue
-        except Exception as exc:
-            last = str(exc)
-            continue
-        if second == b"" and declared == sent + 40 and len(first) == sent:
-            return declared, len(first)
-        last = f"declared={declared} first={len(first)} second={len(second)}"
-    raise AssertionError(last)
+    def __init__(self, body: bytes, declared: int, url: str) -> None:
+        self._body = body
+        self._pos = 0
+        self.headers = {"Content-Length": str(declared)}
+        self.status = 200
+        self._url = url
+
+    def geturl(self) -> str:
+        return self._url
+
+    def getcode(self) -> int:
+        return 200
+
+    def read(self, amount: int = -1) -> bytes:
+        if amount is None or amount < 0:
+            amount = len(self._body) - self._pos
+        if self._pos >= len(self._body):
+            return b""
+        chunk = self._body[self._pos : self._pos + amount]
+        self._pos += len(chunk)
+        return chunk
+
+    def __enter__(self) -> "_EofStream":
+        return self
+
+    def __exit__(self, *_args: object) -> bool:
+        return False
 
 
-def test_eof_short_body_reports_truncation_and_keeps_no_file(tmp_path: Path):
+def test_eof_short_body_reports_truncation_and_keeps_no_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     sent = (PHOTOS / "dot.png").read_bytes()
-    probe = ProbeServer("eof")
-    try:
-        declared, received = _observe_eof_gap(probe.url(), len(sent))
-        assert declared - received == 40
-        result = download_one(probe.url(), tmp_path)
-    finally:
-        probe.shutdown()
+    assert len(sent) == 69
+    url = "http://127.0.0.1/dot.png"
+    seen: dict[str, object] = {}
+
+    def opener(request: object, timeout: float = 30) -> _EofStream:
+        seen["timeout"] = timeout
+        seen["request"] = request
+        stream = _EofStream(sent, len(sent) + 40, url)
+        seen["stream"] = stream
+        return stream
+
+    monkeypatch.setattr(images, "urlopen", opener)
+    result = download_one(url, tmp_path)
+    stream = seen["stream"]
+    assert isinstance(stream, _EofStream)
+    assert stream._pos == len(sent)
+    assert seen["timeout"] == 30
+    assert int(stream.headers["Content-Length"]) - stream._pos == 40
     assert result.error == "응답이 잘렸습니다"
     _failed_clean(result, tmp_path)
+    log_path = os.environ.get("WO04S4_CLASS_LOG")
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write("contract-eof\n")
+            handle.flush()
+
+
+def _local_port(response: object) -> int | None:
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if sock is None and raw is not None:
+        sock = getattr(getattr(raw, "raw", None), "_sock", None)
+    if sock is None:
+        return None
+    try:
+        return int(sock.getsockname()[1])
+    except OSError:
+        return None
+
+
+class _TrackedResponse:
+    """Log the reads of the socket ``download_one`` is using."""
+
+    def __init__(self, inner: object, record: dict[str, object]) -> None:
+        self._inner = inner
+        self._record = record
+        self.headers = inner.headers
+        self.status = getattr(inner, "status", None)
+        record["port"] = _local_port(inner)
+        try:
+            record["declared"] = int(inner.headers["Content-Length"])
+        except (TypeError, ValueError, KeyError):
+            record["declared"] = None
+
+    def geturl(self) -> str:
+        return self._inner.geturl()
+
+    def getcode(self) -> int:
+        return int(self._inner.getcode())
+
+    def read(self, amount: int = -1) -> bytes:
+        try:
+            chunk = self._inner.read(amount)
+        except TimeoutError:
+            self._record["kind"] = "timeout"
+            raise
+        except ConnectionResetError:
+            self._record["kind"] = "rst"
+            raise
+        except Exception as exc:
+            partial = getattr(exc, "partial", None)
+            if partial is not None:
+                self._record["kind"] = "eof"
+                self._record["received"] = int(self._record["received"]) + len(partial)
+            else:
+                self._record["kind"] = type(exc).__name__
+            raise
+        self._record["received"] = int(self._record["received"]) + len(chunk)
+        if chunk == b"":
+            self._record["kind"] = "eof"
+        return chunk
+
+    def __enter__(self) -> "_TrackedResponse":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> object:
+        return self._inner.__exit__(exc_type, exc, tb)
+
+
+def _pair_sockets(probe: ProbeServer, attempts: list[dict[str, object]], before: int) -> None:
+    fresh = probe.sockets[before:]
+    used: set[int] = set()
+    for attempt in attempts:
+        port = attempt.get("port")
+        match = None
+        if port is not None:
+            for record in fresh:
+                if record["id"] in used:
+                    continue
+                if record.get("peer_port") == port:
+                    match = record
+                    break
+        attempt["server_id"] = None if match is None else match["id"]
+        if match is not None:
+            used.add(int(match["id"]))
+    missing = [item for item in attempts if item["server_id"] is None]
+    if missing and len(fresh) == len(attempts):
+        for attempt, record in zip(attempts, fresh):
+            if attempt["server_id"] is None:
+                attempt["server_id"] = record["id"]
+    assert all(item["server_id"] is not None for item in attempts)
+    assert len({item["server_id"] for item in attempts}) == len(attempts)
+
+
+def test_tcp_early_close_is_classified_on_the_same_socket(tmp_path: Path):
+    """A real short close is either clean EOF or RST on that same socket.
+
+    The product result has to name the ending this download actually saw.
+    A timeout is neither. S3's 26/30 is the separate-connection check, not
+    this one.
+    """
+
+    sent = (PHOTOS / "dot.png").read_bytes()
+    probe = ProbeServer("eof")
+    attempts: list[dict[str, object]] = []
+    real_open = images.urlopen
+
+    def opener(request: object, timeout: float = 30):
+        record: dict[str, object] = {"kind": None, "port": None, "declared": None, "received": 0, "server_id": None}
+        try:
+            response = real_open(request, timeout=timeout)
+        except ConnectionResetError:
+            record["kind"] = "rst"
+            attempts.append(record)
+            raise
+        except Exception as exc:
+            reason = getattr(exc, "reason", exc)
+            record["kind"] = "rst" if isinstance(reason, ConnectionResetError) else type(exc).__name__
+            attempts.append(record)
+            raise
+        tracked = _TrackedResponse(response, record)
+        attempts.append(record)
+        return tracked
+
+    before = len(probe.sockets)
+    images.urlopen = opener
+    try:
+        result = download_one(probe.url(), tmp_path)
+    finally:
+        images.urlopen = real_open
+        probe.shutdown()
+    _failed_clean(result, tmp_path)
+    assert attempts
+    _pair_sockets(probe, attempts, before)
+    kinds = [str(item["kind"]) for item in attempts]
+    assert "timeout" not in kinds
+    assert "timed out" not in result.error
+    last = attempts[-1]
+    if last["kind"] == "eof":
+        assert result.error == "응답이 잘렸습니다"
+        assert last["declared"] == len(sent) + 40
+        assert last["received"] == len(sent)
+        assert int(last["declared"]) - int(last["received"]) == 40
+    elif last["kind"] == "rst":
+        assert kinds == ["rst"] * len(kinds)
+        assert "10054" in result.error
+        assert "잘렸" not in result.error
+    else:
+        raise AssertionError(f"unclassified {kinds} error={result.error}")
+    log_path = os.environ.get("WO04S4_CLASS_LOG")
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(f"early-{last['kind']}\n")
+            handle.flush()
 
 
 def test_tcp_reset_stays_a_reset_and_keeps_no_file(tmp_path: Path):

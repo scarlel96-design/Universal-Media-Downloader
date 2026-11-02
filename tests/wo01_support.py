@@ -133,6 +133,9 @@ class ProbeServer:
         self.hold = hold
         ensure_photos()
         self._body = (PHOTOS / "dot.png").read_bytes()
+        self._lock = threading.Lock()
+        self._next_id = 0
+        self.sockets: list[dict[str, object]] = []
         self._socket = socket.create_server(("127.0.0.1", 0), backlog=32)
         self.port = int(self._socket.getsockname()[1])
         self._stop = threading.Event()
@@ -161,6 +164,18 @@ class ProbeServer:
             threading.Thread(target=self._client, args=(connection,), daemon=True).start()
 
     def _client(self, connection: socket.socket) -> None:
+        with self._lock:
+            self._next_id += 1
+            record: dict[str, object] = {
+                "id": self._next_id,
+                "peer_port": None,
+                "mode": self.mode,
+            }
+            self.sockets.append(record)
+        try:
+            record["peer_port"] = connection.getpeername()[1]
+        except OSError:
+            record["peer_port"] = None
         try:
             connection.settimeout(2)
             raw = b""
