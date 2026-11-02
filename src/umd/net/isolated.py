@@ -58,6 +58,7 @@ def call(op: str, payload: dict, *, timeout: float = 180) -> dict:
         )
     finally:
         vault.drop_many(refs)
+        vault.sweep_expired_outbound()
     raw_out = proc.stdout.decode("utf-8", errors="replace")
     raw_err = proc.stderr.decode("utf-8", errors="replace")
     if (
@@ -94,4 +95,5 @@ def call(op: str, payload: dict, *, timeout: float = 180) -> dict:
         materialized = materialize_payload(enriched)
     finally:
         vault.drop_many(found)
+        vault.sweep_expired_outbound()
     return materialized if isinstance(materialized, dict) else {}

@@ -7,6 +7,8 @@ can share the connection. The UI model is still updated only on the UI thread.
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -18,6 +20,10 @@ from umd.download.images import sniff_image
 from umd.secrets import SecretUnavailable, SecretVault, activate, has_secret_url, scrub_text
 
 SCHEMA_VERSION = 3
+_log = logging.getLogger("umd.storage")
+_RESUME_ITEMS = {"일시정지", "다운로드 중", "대기", "재인증 필요"}
+_RESUME_JOBS = {"일시정지", "다운로드 중", "대기", "재인증 필요", "추출 완료", "추출 중"}
+_TERMINAL_JOBS = {"완료", "취소", "실패"}
 
 _JOBS = """
 CREATE TABLE jobs (
@@ -218,7 +224,9 @@ class Library:
         except Exception:
             self._conn.rollback()
             raise
-        self.recovery = self._expire_lost_secrets() + self._recover()
+        self.recovery = (
+            self._expire_lost_secrets() + self._reconcile_job_secrets() + self._recover()
+        )
 
     def _column_names(self, table: str) -> set[str]:
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -352,6 +360,191 @@ class Library:
                 notes.append(f"reauth:{row['id']}")
         self._conn.commit()
         return notes
+
+    def _job_may_drop_page_secret(self, job_id: str, status: str) -> bool:
+        if status in _RESUME_JOBS or status not in _TERMINAL_JOBS:
+            return False
+        rows = self._conn.execute(
+            "SELECT download_status FROM media_items WHERE job_id = ?",
+            (job_id,),
+        ).fetchall()
+        return not any(str(row["download_status"] or "") in _RESUME_ITEMS for row in rows)
+
+    def _drop_ref_file(self, ref: str, *, strict: bool) -> bool:
+        try:
+            self.vault.drop(ref)
+        except OSError:
+            _log.info("secret release failed %s", ref)
+            if strict:
+                raise RuntimeError("작업 참조를 지우지 못했습니다") from None
+            return False
+        if (self.vault.root / f"{ref}.json").exists():
+            _log.info("secret release failed %s", ref)
+            if strict:
+                raise RuntimeError("작업 참조를 지우지 못했습니다")
+            return False
+        return True
+
+    def _release_job_secret_if_allowed(self, job_id: str, *, strict: bool) -> bool:
+        row = self._conn.execute(
+            "SELECT status, secret_ref FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        ref = str(row["secret_ref"] or "")
+        status = str(row["status"] or "")
+        if not self._job_may_drop_page_secret(job_id, status):
+            return False
+        items = self._conn.execute(
+            "SELECT id, download_status, secret_ref FROM media_items WHERE job_id = ?",
+            (job_id,),
+        ).fetchall()
+        item_ids: list[str] = []
+        for item in items:
+            if str(item["download_status"] or "") not in {"완료", "취소"}:
+                continue
+            item_ref = str(item["secret_ref"] or "")
+            if not item_ref:
+                continue
+            if not self._drop_ref_file(item_ref, strict=strict):
+                self._conn.rollback()
+                return False
+            item_ids.append(str(item["id"]))
+        if ref and not self._drop_ref_file(ref, strict=strict):
+            self._conn.rollback()
+            return False
+        if not ref and not item_ids:
+            return False
+        for item_id in item_ids:
+            self._conn.execute(
+                "UPDATE media_items SET secret_ref = '' WHERE id = ?",
+                (item_id,),
+            )
+        if ref:
+            self._conn.execute("UPDATE jobs SET secret_ref = '' WHERE id = ?", (job_id,))
+        self._conn.commit()
+        _log.info("job secret release %s", job_id)
+        return True
+
+    def _reconcile_job_secrets(self) -> list[str]:
+        notes: list[str] = []
+        if "secret_ref" not in self._column_names("jobs"):
+            return notes
+        rows = self._conn.execute(
+            "SELECT id, status, secret_ref FROM jobs WHERE secret_ref != ''"
+        ).fetchall()
+        for row in rows:
+            job_id = str(row["id"])
+            ref = str(row["secret_ref"] or "")
+            status = str(row["status"] or "")
+            try:
+                self.vault.read(ref, job_id=job_id, item_id="")
+                readable = True
+            except SecretUnavailable:
+                readable = False
+            if self._job_may_drop_page_secret(job_id, status):
+                if self._release_job_secret_if_allowed(job_id, strict=False):
+                    notes.append(f"job-release:{job_id}")
+                elif ref:
+                    notes.append(f"job-release-failed:{job_id}")
+                continue
+            if readable:
+                continue
+            if status in {"완료", "취소"}:
+                self._conn.execute("UPDATE jobs SET secret_ref = '' WHERE id = ?", (job_id,))
+                notes.append(f"job-clear:{job_id}")
+                _log.info("job secret clear %s", job_id)
+                continue
+            self._conn.execute(
+                """
+                UPDATE jobs
+                   SET status = '재인증 필요', completed_at = NULL, secret_ref = ''
+                 WHERE id = ?
+                """,
+                (job_id,),
+            )
+            notes.append(f"job-reauth:{job_id}")
+            _log.info("job secret reauth %s", job_id)
+        self._drop_unreferenced_terminal_files(notes)
+        self._conn.commit()
+        return notes
+
+    def _drop_unreferenced_terminal_files(self, notes: list[str]) -> None:
+        if not self.vault.root.is_dir():
+            return
+        linked = {
+            str(row["secret_ref"])
+            for row in self._conn.execute(
+                "SELECT secret_ref FROM jobs WHERE secret_ref != ''"
+            ).fetchall()
+        }
+        linked.update(
+            str(row["secret_ref"])
+            for row in self._conn.execute(
+                "SELECT secret_ref FROM media_items WHERE secret_ref != ''"
+            ).fetchall()
+        )
+        inspected = 0
+        try:
+            entries = self.vault.root.iterdir()
+        except OSError:
+            _log.info("orphan sweep skipped")
+            return
+        for path in entries:
+            if inspected >= 64:
+                break
+            inspected += 1
+            name = path.name
+            if not name.endswith(".json") or path.is_symlink():
+                continue
+            ref = name[:-5]
+            if len(ref) != 32 or ref in linked:
+                continue
+            try:
+                if path.resolve().parent != self.vault.root.resolve():
+                    continue
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeError, ValueError):
+                continue
+            if not isinstance(data, dict) or data.get("expires_at") is not None:
+                continue
+            job_id = str(data.get("job_id") or "")
+            item_id = str(data.get("item_id") or "")
+            if not job_id or job_id == "outbound":
+                continue
+            if not self._orphan_is_terminal(job_id, item_id):
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                notes.append(f"orphan-kept:{ref}")
+                _log.info("orphan kept %s", ref)
+                continue
+            notes.append(f"orphan-removed:{ref}")
+            _log.info("orphan removed %s", ref)
+
+    def _orphan_is_terminal(self, job_id: str, item_id: str) -> bool:
+        job = self._conn.execute(
+            "SELECT status, secret_ref FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if job is None or str(job["secret_ref"] or ""):
+            return False
+        if item_id == "":
+            return self._job_may_drop_page_secret(job_id, str(job["status"] or ""))
+        item = self._conn.execute(
+            """
+            SELECT secret_ref, download_status FROM media_items
+             WHERE id = ? AND job_id = ?
+            """,
+            (item_id, job_id),
+        ).fetchone()
+        if item is None or str(item["secret_ref"] or ""):
+            return False
+        return str(item["download_status"] or "") in {"완료", "취소"}
 
     def _migrate(self, version: int) -> None:
         existing = self._column_names("media_items")
@@ -579,6 +772,7 @@ class Library:
                 (status, completed, job_id),
             )
             self._conn.commit()
+            self._release_job_secret_if_allowed(job_id, strict=True)
 
     def latest_job(self) -> dict | None:
         with self._lock:
@@ -820,3 +1014,5 @@ class Library:
                     "UPDATE jobs SET status = '완료', completed_at = ? WHERE id = ?",
                     (_now(), job_id),
                 )
+                self._conn.commit()
+                self._release_job_secret_if_allowed(job_id, strict=False)

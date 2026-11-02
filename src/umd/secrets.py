@@ -9,6 +9,7 @@ cookie, or an authorization value.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -21,8 +22,11 @@ _URL = re.compile(r"https?://[^\s\"'<>]+", re.I)
 _HEADER = re.compile(r"(?i)\b(authorization|cookie)\b\s*[:=]\s*\S+")
 _REF = re.compile(r"umdref://([0-9a-f]{32})\b")
 _REF_NAME = re.compile(r"^[0-9a-f]{32}$")
+_OUTBOUND_TTL = 3600
+_SWEEP_LIMIT = 64
 _ACTIVE: "SecretVault | None" = None
 _DEFAULT: "SecretVault | None" = None
+_log = logging.getLogger("umd.secrets")
 
 
 class ProtectError(RuntimeError):
@@ -203,8 +207,14 @@ def write_private(directory: Path, name: str, text: str) -> None:
 
 
 class SecretVault:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, clock=None) -> None:
         self.root = Path(root)
+        self._clock = clock or time.time
+        self._active: set[str] = set()
+        self.sweep_expired_outbound()
+
+    def _now(self) -> float:
+        return float(self._clock())
 
     def put(self, job_id: str, item_id: str, urls: dict[str, str]) -> str:
         secret = {key: value for key, value in urls.items() if value and has_secret_url(value)}
@@ -222,27 +232,36 @@ class SecretVault:
         return ref
 
     def put_outbound(self, url: str) -> str:
+        self.sweep_expired_outbound()
         ref = uuid4().hex
+        self._active.add(ref)
         protect_directory(self.root)
         payload = {
             "job_id": "outbound",
             "item_id": ref,
             "urls": {"value": url},
-            "expires_at": time.time() + 3600,
+            "expires_at": self._now() + _OUTBOUND_TTL,
         }
-        write_private(self.root, f"{ref}.json", json.dumps(payload, ensure_ascii=False))
+        try:
+            write_private(self.root, f"{ref}.json", json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            self._active.discard(ref)
+            raise
+        self.sweep_expired_outbound()
         return ref
 
     def read(self, ref: str, *, job_id: str, item_id: str) -> dict[str, str]:
         path = self._path(ref)
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except OSError as exc:
             raise SecretUnavailable("보호된 참조를 읽지 못했습니다") from exc
+        except json.JSONDecodeError:
+            raise SecretUnavailable("보호된 참조를 읽지 못했습니다") from None
         if data.get("job_id") != job_id or data.get("item_id") != item_id:
             raise SecretUnavailable("보호된 참조를 읽지 못했습니다")
         expires = data.get("expires_at")
-        if expires is not None and float(expires) <= time.time():
+        if expires is not None and float(expires) <= self._now():
             raise SecretUnavailable("보호된 참조가 만료되었습니다")
         urls = data.get("urls")
         if not isinstance(urls, dict):
@@ -253,13 +272,75 @@ class SecretVault:
         if not ref or not _REF_NAME.fullmatch(ref):
             return
         try:
-            self._path(ref).unlink(missing_ok=True)
+            path = self._path(ref)
         except SecretUnavailable:
+            self._active.discard(ref)
             return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            raise
+        self._active.discard(ref)
 
     def drop_many(self, refs: list[str]) -> None:
         for ref in refs:
             self.drop(ref)
+
+    def sweep_expired_outbound(self) -> int:
+        """Remove a bounded batch of expired outbound refs. Job refs stay."""
+
+        if not self.root.is_dir() or is_reparse(self.root):
+            return 0
+        removed = 0
+        inspected = 0
+        try:
+            entries = self.root.iterdir()
+        except OSError:
+            _log.info("outbound sweep skipped")
+            return 0
+        for path in entries:
+            if inspected >= _SWEEP_LIMIT:
+                break
+            inspected += 1
+            if self._release_expired_outbound(path):
+                removed += 1
+        if removed:
+            _log.info("outbound sweep removed %s", removed)
+        return removed
+
+    def _release_expired_outbound(self, path: Path) -> bool:
+        try:
+            if not path.is_file() or path.is_symlink() or is_reparse(path):
+                return False
+            name = path.name
+            if not name.endswith(".json"):
+                return False
+            ref = name[:-5]
+            if not _REF_NAME.fullmatch(ref) or ref in self._active:
+                return False
+            root = self.root.resolve()
+            resolved = path.resolve()
+            if resolved.parent != root:
+                return False
+            data = json.loads(resolved.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or data.get("job_id") != "outbound":
+                return False
+            expires = data.get("expires_at")
+            if expires is None:
+                return False
+            deadline = float(expires)
+        except (OSError, json.JSONDecodeError, UnicodeError, TypeError, ValueError):
+            return False
+        if self._now() < deadline:
+            return False
+        try:
+            resolved.unlink()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            _log.info("outbound sweep kept %s", ref)
+            return False
+        return True
 
     def _path(self, ref: str) -> Path:
         if not _REF_NAME.fullmatch(ref or ""):
