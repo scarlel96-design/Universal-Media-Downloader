@@ -65,17 +65,28 @@ class SessionStore:
         self.sweep()
 
     def save(self, host: str, state: dict, *, expires_at: float) -> None:
+        from umd.secrets import ProtectError, assert_no_reparse, protect_directory, write_private
+
         directory = self._dir(host)
+        try:
+            assert_no_reparse(directory.parent)
+        except ProtectError as exc:
+            raise SessionProtectError("세션을 보호하지 못해 저장하지 않았습니다") from exc
         if directory.exists():
+            if directory.is_symlink():
+                raise SessionProtectError("세션을 보호하지 못해 저장하지 않았습니다")
             shutil.rmtree(directory)
-        directory.mkdir(parents=True)
+        try:
+            protect_directory(directory)
+        except ProtectError as exc:
+            raise SessionProtectError("세션을 보호하지 못해 저장하지 않았습니다") from exc
         safe = _state_for_host(host, state)
-        (directory / "state.json").write_text(json.dumps(safe), encoding="utf-8")
-        (directory / "expires").write_text(str(expires_at), encoding="ascii")
-        if _restrict(directory):
-            return
-        shutil.rmtree(directory, ignore_errors=True)
-        raise SessionProtectError("세션을 보호하지 못해 저장하지 않았습니다")
+        try:
+            write_private(directory, "state.json", json.dumps(safe))
+            write_private(directory, "expires", str(expires_at))
+        except OSError:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise SessionProtectError("세션을 보호하지 못해 저장하지 않았습니다") from None
 
     def load(self, host: str) -> dict | None:
         directory = self._dir(host)
@@ -221,7 +232,15 @@ def _restrict(directory: Path) -> bool:
     if not user:
         return False
     grant = subprocess.run(
-        ["icacls", str(directory), "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F"],
+        [
+            "icacls",
+            str(directory),
+            "/inheritance:r",
+            "/grant:r",
+            f"{user}:(OI)(CI)F",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+        ],
         capture_output=True,
         timeout=10,
         check=False,
@@ -241,4 +260,6 @@ def _restrict(directory: Path) -> bool:
     except LookupError:
         encoded = user.encode()
     blob = shown.stdout or b""
-    return encoded in blob and b"(OI)(CI)(F)" in blob
+    user_held = encoded in blob and b"(OI)(CI)(F)" in blob
+    system_held = b"SYSTEM" in blob or b"S-1-5-18" in blob
+    return user_held and system_held

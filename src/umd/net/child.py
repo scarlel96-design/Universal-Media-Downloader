@@ -12,38 +12,132 @@ import sys
 import traceback
 from pathlib import Path
 
+from umd.secrets import (
+    SecretVault,
+    collect_secrets,
+    materialize_payload,
+    scrub_text,
+    seal_tree,
+    signed_urls_in,
+    text_contains_secret,
+)
+
+_GENERIC = {"ok": False, "kind": "ExtractError", "error": "작업을 완료하지 못했습니다", "trace": ""}
+
+
+class _CapturedStream:
+    """Hold third-party diagnostics until they can be scrubbed."""
+
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+        self.encoding = "utf-8"
+
+    def write(self, data: object) -> int:
+        if isinstance(data, bytes):
+            text = data.decode("utf-8", "replace")
+        else:
+            text = str(data)
+        self.parts.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+    def isatty(self) -> bool:
+        return False
+
+    @property
+    def buffer(self) -> "_CapturedStream":
+        return self
+
+
+def _write_json(stream, body: dict, secrets: list[str], vault: SecretVault | None = None) -> None:
+    if body.get("ok"):
+        public = {"ok": True, "result": seal_tree(body.get("result"), vault, secrets)}
+    else:
+        public = {
+            "ok": False,
+            "kind": str(body.get("kind") or "ExtractError"),
+            "error": scrub_text(str(body.get("error") or ""), secrets)[:500],
+            "trace": scrub_text(str(body.get("trace") or ""), secrets)[-800:],
+        }
+    text = json.dumps(public, ensure_ascii=False)
+    if text_contains_secret(text, secrets) or signed_urls_in(text):
+        text = json.dumps(_GENERIC, ensure_ascii=False)
+    stream.buffer.write(text.encode("utf-8"))
+    stream.buffer.write(b"\n")
+    stream.buffer.flush()
+
+
+def _emit_captured(capture: _CapturedStream, stream, secrets: list[str]) -> None:
+    raw = "".join(capture.parts)
+    if not raw:
+        return
+    try:
+        cleaned = scrub_text(raw, secrets)
+    except Exception:
+        cleaned = "작업을 완료하지 못했습니다\n"
+    if text_contains_secret(cleaned, secrets) or signed_urls_in(cleaned):
+        cleaned = "작업을 완료하지 못했습니다\n"
+    stream.write(cleaned)
+    stream.flush()
+
 
 def main() -> int:
     os.environ["UMD_IN_WORKER"] = "1"
     raw = sys.stdin.buffer.read()
     real_out = sys.stdout
+    real_err = sys.stderr
+    capture = _CapturedStream()
+    sys.stderr = capture
+    secrets: list[str] = []
+    code = 1
     try:
-        request = json.loads(raw.decode("utf-8"))
+        try:
+            request = json.loads(raw.decode("utf-8"))
+        except Exception:
+            secrets = collect_secrets(raw.decode("utf-8", errors="replace"))
+            raise
+        secrets = collect_secrets(request)
         op = str(request.get("op") or "")
         payload = request.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        root = str(payload.get("vaultRoot") or "")
+        vault = SecretVault(Path(root)) if root else None
         # Redirect extractor chatter before any third-party import prints.
-        sys.stdout = sys.stderr
+        sys.stdout = capture
         from umd.netpolicy import public_resolution
 
         with public_resolution():
-            result = _dispatch(op, payload)
+            result = _dispatch(op, materialize_payload(payload))
         sys.stdout = real_out
-        real_out.buffer.write(json.dumps({"ok": True, "result": result}, ensure_ascii=False).encode("utf-8"))
-        real_out.buffer.write(b"\n")
-        return 0
+        _write_json(real_out, {"ok": True, "result": result}, secrets, vault)
+        code = 0
     except BaseException as exc:
         sys.stdout = real_out
         kind = type(exc).__name__
         if kind not in {"PolicyError", "DnsError", "ExtractError", "AuthError", "TransferStop"}:
             kind = "ExtractError"
-        body = {"ok": False, "kind": kind, "error": str(exc)[:500], "trace": traceback.format_exc()[-800:]}
         try:
-            real_out.buffer.write(json.dumps(body, ensure_ascii=False).encode("utf-8"))
-            real_out.buffer.write(b"\n")
-            real_out.buffer.flush()
+            message = scrub_text(f"{exc}\n{raw.decode('utf-8', errors='replace')}", secrets)[:500]
+            trace = scrub_text(traceback.format_exc(), secrets)[-800:]
+        except Exception:
+            message, trace = "작업을 완료하지 못했습니다", ""
+        if text_contains_secret(message + trace, secrets) or signed_urls_in(message + trace):
+            message, trace = "작업을 완료하지 못했습니다", ""
+        try:
+            _write_json(real_out, {"ok": False, "kind": kind, "error": message, "trace": trace}, secrets)
         except Exception:
             pass
-        return 1
+    finally:
+        sys.stdout = real_out
+        sys.stderr = real_err
+        try:
+            _emit_captured(capture, real_err, secrets)
+        except Exception:
+            pass
+    return code
 
 
 def _dispatch(op: str, payload: dict) -> dict:

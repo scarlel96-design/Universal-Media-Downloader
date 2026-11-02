@@ -15,6 +15,7 @@ from uuid import uuid4
 from zlib import crc32
 
 from umd.download.images import sniff_image
+from umd.secrets import SecretUnavailable, SecretVault, activate, has_secret_url, scrub_text
 
 SCHEMA_VERSION = 3
 
@@ -24,7 +25,8 @@ CREATE TABLE jobs (
     page_url TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    completed_at TEXT
+    completed_at TEXT,
+    secret_ref TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -66,7 +68,8 @@ CREATE TABLE media_items (
     height INTEGER,
     duration REAL,
     format TEXT NOT NULL DEFAULT '',
-    subtitles TEXT NOT NULL DEFAULT ''
+    subtitles TEXT NOT NULL DEFAULT '',
+    secret_ref TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -161,6 +164,12 @@ class Library:
         self._lock = threading.RLock()
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self.vault = SecretVault(Path(str(path) + ".secrets"))
+        else:
+            import tempfile
+
+            self.vault = SecretVault(Path(tempfile.mkdtemp(prefix="umd-secrets-")))
+        activate(self.vault)
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -202,11 +211,147 @@ class Library:
             else:
                 self._conn.execute(_HOSTS)
                 self._conn.commit()
-        self.recovery = self._recover()
+        try:
+            self._ensure_secret_columns()
+            self._strip_persisted_secrets()
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        self.recovery = self._expire_lost_secrets() + self._recover()
 
     def _column_names(self, table: str) -> set[str]:
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
         return {str(row["name"]) for row in rows}
+
+    def _text_columns(self, table: str) -> list[str]:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        names: list[str] = []
+        for row in rows:
+            declared = str(row["type"] or "")
+            if declared == "" or "TEXT" in declared.upper() or "CHAR" in declared.upper():
+                names.append(str(row["name"]))
+        return names
+
+    def _ensure_secret_columns(self) -> None:
+        tables = {
+            "jobs": "secret_ref TEXT NOT NULL DEFAULT ''",
+            "media_items": "secret_ref TEXT NOT NULL DEFAULT ''",
+        }
+        for table, declaration in tables.items():
+            names = self._column_names(table)
+            if names and "secret_ref" not in names:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {declaration}")
+
+    def _strip_persisted_secrets(self) -> None:
+        url_columns = {"page_url", "media_url", "original_url", "thumbnail_url", "media_reference"}
+        skip = {"id", "job_id", "secret_ref"}
+        for table in ("jobs", "media_items", "host_status"):
+            columns = [name for name in self._text_columns(table) if name not in skip]
+            if not columns:
+                continue
+            rows = self._conn.execute(f"SELECT * FROM {table}").fetchall()
+            for row in rows:
+                assignments: list[str] = []
+                params: list[object] = []
+                url_changed = False
+                keys = set(row.keys())
+                for name in columns:
+                    if name not in keys:
+                        continue
+                    current = row[name]
+                    if not isinstance(current, str) or current == "":
+                        continue
+                    cleaned = scrub_text(current)
+                    if cleaned == current:
+                        continue
+                    assignments.append(f"{name} = ?")
+                    params.append(cleaned)
+                    if name in url_columns:
+                        url_changed = True
+                status = str(row["download_status"]) if "download_status" in keys else ""
+                if table == "media_items" and url_changed and status not in {"완료", "취소"}:
+                    assignments.append("download_status = ?")
+                    params.append("재인증 필요")
+                if not assignments:
+                    continue
+                if table == "host_status":
+                    params.append(row["host"])
+                    target = "host"
+                else:
+                    params.append(row["id"])
+                    target = "id"
+                self._conn.execute(
+                    f"UPDATE {table} SET {', '.join(assignments)} WHERE {target} = ?",
+                    params,
+                )
+
+    def durability_scope(self) -> dict:
+        row = self._conn.execute("PRAGMA journal_mode").fetchone()
+        mode = str(row[0] if row is not None else "")
+        path = None if self.path == ":memory:" else Path(self.path)
+        return {
+            "journal_mode": mode,
+            "wal": bool(path and Path(str(path) + "-wal").is_file()),
+            "shm": bool(path and Path(str(path) + "-shm").is_file()),
+            "physical_delete": False,
+        }
+
+    def transfer_urls(self, item_id: str) -> dict | None:
+        """Live URLs for one item. None means the protected reference is gone."""
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM media_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                return {}
+            base = {
+                "page": str(row["page_url"] or ""),
+                "media": str(row["media_url"] or ""),
+                "original": str(row["original_url"] or row["media_url"] or ""),
+                "thumbnail": str(row["thumbnail_url"] or ""),
+                "reference": str(row["media_reference"] or ""),
+            }
+            ref = str(row["secret_ref"] or "")
+            if not ref:
+                return base
+            try:
+                secret = self.vault.read(ref, job_id=str(row["job_id"]), item_id=item_id)
+            except SecretUnavailable:
+                return None
+            base.update(secret)
+            return base
+
+    def _expire_lost_secrets(self) -> list[str]:
+        notes: list[str] = []
+        if "secret_ref" not in self._column_names("media_items"):
+            return notes
+        rows = self._conn.execute(
+            "SELECT id, job_id, secret_ref, download_status FROM media_items WHERE secret_ref != ''"
+        ).fetchall()
+        for row in rows:
+            ref = str(row["secret_ref"] or "")
+            status = str(row["download_status"] or "")
+            if status in {"완료", "취소"}:
+                self.vault.drop(ref)
+                self._conn.execute("UPDATE media_items SET secret_ref = '' WHERE id = ?", (row["id"],))
+                continue
+            try:
+                self.vault.read(ref, job_id=str(row["job_id"]), item_id=str(row["id"]))
+            except SecretUnavailable:
+                self._conn.execute(
+                    """
+                    UPDATE media_items
+                       SET download_status = '재인증 필요', secret_ref = '', note = ?
+                     WHERE id = ?
+                    """,
+                    ("보호된 주소를 다시 열지 못했습니다", row["id"]),
+                )
+                notes.append(f"reauth:{row['id']}")
+        self._conn.commit()
+        return notes
 
     def _migrate(self, version: int) -> None:
         existing = self._column_names("media_items")
@@ -229,6 +374,8 @@ class Library:
             self._conn.execute(
                 "UPDATE media_items SET media_type = 'image' WHERE media_type = ''"
             )
+        self._ensure_secret_columns()
+        self._strip_persisted_secrets()
         self._conn.execute("UPDATE schema_meta SET version = ?", (SCHEMA_VERSION,))
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
@@ -237,9 +384,16 @@ class Library:
         with self._lock:
             job_id = uuid4().hex
             created = _now()
+            page_stored = scrub_text(page_url)
+            job_ref = ""
+            if has_secret_url(page_url):
+                job_ref = self.vault.put(job_id, "", {"page": page_url})
             self._conn.execute(
-                "INSERT INTO jobs(id, page_url, status, created_at, completed_at) VALUES (?, ?, ?, ?, NULL)",
-                (job_id, page_url, "추출 완료", created),
+                """
+                INSERT INTO jobs(id, page_url, status, created_at, completed_at, secret_ref)
+                VALUES (?, ?, ?, ?, NULL, ?)
+                """,
+                (job_id, page_stored, "추출 완료", created, job_ref),
             )
             for row in rows:
                 item_id = uuid4().hex
@@ -249,6 +403,20 @@ class Library:
                 duration = row.get("duration")
                 duration_value = float(duration) if isinstance(duration, (int, float)) and duration else None
                 filesize = _optional_int(row.get("filesize"))
+                media = str(row.get("mediaUrl") or "")
+                original = str(row.get("originalUrl") or media)
+                reference = str(row.get("mediaReference") or media)
+                thumbnail = str(row.get("thumbnailUrl") or "")
+                secret_fields = {
+                    "page": page_url,
+                    "media": media,
+                    "original": original,
+                    "thumbnail": thumbnail,
+                    "reference": reference,
+                }
+                secret_fields = {key: value for key, value in secret_fields.items() if has_secret_url(value)}
+                ref = self.vault.put(job_id, item_id, secret_fields) if secret_fields else ""
+                row["secretRef"] = ref
                 self._conn.execute(
                     """
                     INSERT INTO media_items (
@@ -256,37 +424,39 @@ class Library:
                         selected, user_override, download_status, saved_path, byte_size,
                         error, created_at, completed_at, priority, total_size,
                         media_type, extractor_id, extractor_version, media_reference,
-                        thumbnail_url, original_url, width, height, duration, format, subtitles
+                        thumbnail_url, original_url, width, height, duration, format, subtitles,
+                        secret_ref
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, '', ?, NULL, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
                         item_id,
                         job_id,
-                        page_url,
-                        row["mediaUrl"],
-                        row["title"],
-                        row["classification"],
-                        row["reasons"],
+                        page_stored,
+                        scrub_text(media),
+                        scrub_text(str(row.get("title") or "")),
+                        scrub_text(str(row.get("classification") or "")),
+                        scrub_text(str(row.get("reasons") or "")),
                         1 if row["selected"] else 0,
-                        row.get("override") or "",
-                        row.get("status") or "대기",
+                        scrub_text(str(row.get("override") or "")),
+                        scrub_text(str(row.get("status") or "대기")),
                         created,
                         int(row.get("priority") or 0),
                         int(filesize or 0),
-                        str(row.get("mediaType") or row.get("kind") or "image"),
-                        str(row.get("extractorId") or ""),
-                        str(row.get("extractorVersion") or ""),
-                        str(row.get("mediaReference") or row.get("mediaUrl") or ""),
-                        str(row.get("thumbnailUrl") or ""),
-                        str(row.get("originalUrl") or row.get("mediaUrl") or ""),
+                        scrub_text(str(row.get("mediaType") or row.get("kind") or "image")),
+                        scrub_text(str(row.get("extractorId") or "")),
+                        scrub_text(str(row.get("extractorVersion") or "")),
+                        scrub_text(reference),
+                        scrub_text(thumbnail),
+                        scrub_text(original),
                         width,
                         height,
                         duration_value,
-                        str(row.get("format") or ""),
-                        str(row.get("subtitles") or ""),
+                        scrub_text(str(row.get("format") or "")),
+                        scrub_text(str(row.get("subtitles") or "")),
+                        ref,
                     ),
                 )
             self._conn.commit()
@@ -298,7 +468,7 @@ class Library:
         with self._lock:
             self._conn.execute(
                 "UPDATE media_items SET selected = ?, user_override = ? WHERE id = ?",
-                (1 if selected else 0, override or "", item_id),
+                (1 if selected else 0, scrub_text(override or ""), item_id),
             )
             self._conn.commit()
 
@@ -329,18 +499,26 @@ class Library:
             params: list[object] = []
             if "status" in values:
                 status = str(values["status"])
+                if status == "실패" and self._has_secret(item_id):
+                    status = "재인증 필요"
                 assignments.append("download_status = ?")
                 params.append(status)
                 if status in {"완료", "실패", "취소"}:
                     assignments.append("completed_at = ?")
                     params.append(_now())
+                    self._release_secret(item_id)
+                elif status == "재인증 필요":
+                    self._release_secret(item_id)
                 elif status in {"다운로드 중", "일시정지", "대기"}:
                     assignments.append("completed_at = NULL")
             for key, column in _TRANSFER.items():
                 if key not in values:
                     continue
+                stored = values[key]
+                if isinstance(stored, str):
+                    stored = scrub_text(stored)
                 assignments.append(f"{column} = ?")
-                params.append(values[key])
+                params.append(stored)
             if "downloaded_bytes" in values or "status" in values:
                 assignments.append("last_progress_at = ?")
                 params.append(_now())
@@ -362,6 +540,14 @@ class Library:
         concurrency_limit: int,
         in_flight: int,
     ) -> None:
+        if not host:
+            return
+        host = scrub_text(host)
+        if "://" in host:
+            from urllib.parse import urlsplit
+
+            host = urlsplit(host).hostname or ""
+        host = host.split("@")[-1].split("/")[0]
         if not host:
             return
         with self._lock:
@@ -387,6 +573,7 @@ class Library:
     def set_job_status(self, job_id: str, status: str) -> None:
         with self._lock:
             completed = _now() if status in {"완료", "실패", "취소"} else None
+            status = scrub_text(status)
             self._conn.execute(
                 "UPDATE jobs SET status = ?, completed_at = ? WHERE id = ?",
                 (status, completed, job_id),
@@ -481,6 +668,7 @@ class Library:
                     "filesize": filesize,
                     "delivery": delivery,
                     "subtitles": item.get("subtitles") or "",
+                    "secretRef": item.get("secret_ref") or "",
                 }
             )
         return rebuilt
@@ -592,6 +780,23 @@ class Library:
         self._conn.commit()
         return notes
 
+    def _has_secret(self, item_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT secret_ref FROM media_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        return bool(row and str(row["secret_ref"] or ""))
+
+    def _release_secret(self, item_id: str) -> None:
+        row = self._conn.execute(
+            "SELECT secret_ref FROM media_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            return
+        self.vault.drop(str(row["secret_ref"] or ""))
+        self._conn.execute("UPDATE media_items SET secret_ref = '' WHERE id = ?", (item_id,))
+
     def _settle_jobs(self, job_ids: set[str]) -> None:
         for job_id in job_ids:
             job = self._conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -603,6 +808,12 @@ class Library:
             ).fetchall()
             statuses = [row["download_status"] for row in rows]
             if any(status in {"다운로드 중", "일시정지", "대기"} for status in statuses):
+                continue
+            if any(status == "재인증 필요" for status in statuses):
+                self._conn.execute(
+                    "UPDATE jobs SET status = '재인증 필요', completed_at = NULL WHERE id = ?",
+                    (job_id,),
+                )
                 continue
             if statuses and all(status == "완료" for status in statuses):
                 self._conn.execute(

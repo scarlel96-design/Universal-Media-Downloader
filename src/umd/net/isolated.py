@@ -8,11 +8,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 from umd.netpolicy import DnsError, ExtractError, PolicyError
+from umd.secrets import (
+    active_vault,
+    default_vault,
+    materialize_payload,
+    scrub_text,
+    seal_payload,
+    signed_urls_in,
+    text_contains_secret,
+)
+
+_REF_IDS = re.compile(r"umdref://([0-9a-f]{32})")
 
 
 class IsolatedStop(ExtractError):
@@ -33,26 +45,53 @@ def call(op: str, payload: dict, *, timeout: float = 180) -> dict:
     env["UMD_IN_WORKER"] = "1"
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2]) + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONIOENCODING"] = "utf-8"
-    proc = subprocess.run(
-        [sys.executable, "-m", "umd.net.child"],
-        input=json.dumps({"op": op, "payload": payload}, ensure_ascii=False).encode("utf-8"),
-        capture_output=True,
-        timeout=timeout,
-        env=env,
-        check=False,
-    )
-    text = proc.stdout.decode("utf-8", errors="replace").strip()
+    vault = active_vault() or default_vault()
+    sealed, secrets, refs = seal_payload(payload)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "umd.net.child"],
+            input=json.dumps({"op": op, "payload": sealed}, ensure_ascii=False).encode("utf-8"),
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    finally:
+        vault.drop_many(refs)
+    raw_out = proc.stdout.decode("utf-8", errors="replace")
+    raw_err = proc.stderr.decode("utf-8", errors="replace")
+    if (
+        text_contains_secret(raw_out, secrets)
+        or text_contains_secret(raw_err, secrets)
+        or signed_urls_in(raw_out)
+        or signed_urls_in(raw_err)
+    ):
+        raise ExtractError("격리 프로세스가 실패했습니다")
+    text = raw_out.strip()
     line = text.splitlines()[-1] if text else ""
     try:
         body = json.loads(line) if line else {}
     except json.JSONDecodeError as exc:
-        detail = (proc.stderr.decode("utf-8", errors="replace") or text)[-400:]
+        detail = scrub_text((raw_err or text)[-400:], secrets)
+        if text_contains_secret(detail, secrets) or signed_urls_in(detail):
+            detail = ""
         raise ExtractError(detail or "격리 프로세스가 결과를 반환하지 않았습니다") from exc
     if proc.returncode != 0 or not body.get("ok"):
         kind = str(body.get("kind") or "ExtractError")
-        message = str(body.get("error") or "격리 프로세스가 실패했습니다")
+        message = scrub_text(str(body.get("error") or "격리 프로세스가 실패했습니다"), secrets)
+        if text_contains_secret(message, secrets) or signed_urls_in(message):
+            message = "격리 프로세스가 실패했습니다"
         if kind == "TransferStop":
             raise IsolatedStop(message)
         raise _KINDS.get(kind, ExtractError)(message)
     result = body.get("result")
-    return result if isinstance(result, dict) else {}
+    if not isinstance(result, dict):
+        return {}
+    found = _REF_IDS.findall(json.dumps(result, ensure_ascii=False))
+    enriched = dict(result)
+    enriched["vaultRoot"] = str(vault.root)
+    try:
+        materialized = materialize_payload(enriched)
+    finally:
+        vault.drop_many(found)
+    return materialized if isinstance(materialized, dict) else {}

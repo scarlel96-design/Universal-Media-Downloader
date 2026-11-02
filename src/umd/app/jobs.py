@@ -12,6 +12,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from umd.download.engine import DownloadEngine, DownloadItem, ItemEvent
 from umd.download.schedule import EngineConfig
+from umd.secrets import redact_url, scrub_text
 from umd.storage.database import Library
 
 
@@ -32,7 +33,7 @@ class ExtractWorker(QObject):
             result = extract_page(self._url, network_mode=self._mode)
             self.finished.emit(json.dumps(result.payload(), ensure_ascii=False))
         except Exception as exc:  # noqa: BLE001 — shown in the shell toast
-            self.failed.emit(str(exc))
+            self.failed.emit(scrub_text(str(exc)))
 
 
 def _split_rows(rows: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
@@ -48,6 +49,31 @@ def _split_rows(rows: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
         else:
             images.append(row)
     return images, videos, galleries
+
+
+def _live_row(library: Library | None, row: dict) -> dict | None:
+    """Resolve a protected reference in memory. A missing reference is not guessed."""
+
+    if str(row.get("status") or "") == "재인증 필요":
+        return None
+    if library is None or not row.get("itemId"):
+        return row
+    urls = library.transfer_urls(str(row.get("itemId") or ""))
+    if urls is None:
+        return None
+    copied = dict(row)
+    if urls.get("media"):
+        copied["fetchUrl"] = urls["media"]
+        copied["mediaUrl"] = urls["media"]
+    if urls.get("original"):
+        copied["originalUrl"] = urls["original"]
+    if urls.get("page"):
+        copied["pageUrl"] = urls["page"]
+    if urls.get("reference"):
+        copied["mediaReference"] = urls["reference"]
+    if urls.get("thumbnail"):
+        copied["thumbnailUrl"] = urls["thumbnail"]
+    return copied
 
 
 def _item_from_row(row: dict) -> DownloadItem:
@@ -156,7 +182,7 @@ class DownloadWorker(QObject):
     @Slot()
     def run(self) -> None:
         self._thread_id = threading.get_ident()
-        images, videos, galleries = _split_rows(self._items)
+        images, videos, galleries = _split_rows(self._ready_items())
         try:
             if images:
                 self._run_images(images)
@@ -172,6 +198,16 @@ class DownloadWorker(QObject):
             self._loop = None
             if loop is not None and not loop.is_closed():
                 loop.close()
+
+    def _ready_items(self) -> list[dict]:
+        ready: list[dict] = []
+        for row in self._items:
+            live = _live_row(self._library, row)
+            if live is None:
+                self._emit_row(row, status="재인증 필요", error="", terminal=True)
+                continue
+            ready.append(live)
+        return ready
 
     def _run_images(self, rows: list[dict]) -> None:
         loop = asyncio.new_event_loop()
@@ -223,12 +259,13 @@ class DownloadWorker(QObject):
                 )
             except Exception as exc:  # noqa: BLE001 — one page failure is not an extractor failure
                 for row in group:
-                    self._emit_row(row, status="실패", error=str(exc)[:300], terminal=True)
+                    self._emit_row(row, status="실패", error=scrub_text(str(exc))[:300], terminal=True)
                 continue
             saved = {item.url: item for item in batch.files}
+            saved.update({redact_url(item.url): item for item in batch.files})
             for row in group:
                 url = str(row.get("originalUrl") or row.get("fetchUrl") or "")
-                item = saved.get(url)
+                item = saved.get(url) or saved.get(redact_url(url))
                 if item is None or item.state == "cancelled":
                     status = "취소" if batch.cancelled or self._cancel_early else "실패"
                     error = "" if status == "취소" else "저장한 파일이 없습니다"
@@ -294,7 +331,7 @@ class DownloadWorker(QObject):
             self._emit_row(row, status="취소", terminal=True)
             return "cancel"
         except Exception as exc:  # noqa: BLE001 — download failure, not an extractor failure
-            self._emit_row(row, status="실패", error=str(exc)[:300], terminal=True)
+            self._emit_row(row, status="실패", error=scrub_text(str(exc))[:300], terminal=True)
             return "fail"
         self._emit_row(
             row,
@@ -346,6 +383,8 @@ class DownloadWorker(QObject):
 
     def _on_event(self, event: ItemEvent) -> None:
         event.py_thread = self._thread_id or threading.get_ident()
+        event.error = scrub_text(event.error)
+        event.note = scrub_text(event.note)
         if self._library is not None and (event.checkpoint or event.terminal):
             self._library.apply_transfer(event.item_id, _db_values(event))
             if event.host:

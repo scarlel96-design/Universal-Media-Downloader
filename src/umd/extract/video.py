@@ -128,7 +128,9 @@ def record_from_info(info: dict, *, page_url: str, version: str) -> MediaRecord:
 
 
 def redact(text: str) -> str:
-    return _SECRET.sub(r"\1", text)[:300]
+    from umd.secrets import scrub_text
+
+    return scrub_text(_SECRET.sub(r"\1", text))[:300]
 
 
 def _client():

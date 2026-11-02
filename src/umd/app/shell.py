@@ -1262,8 +1262,16 @@ class ShellState(QObject):
         if self._download_thread is not None and self._download_thread.isRunning():
             self._notify("이미 다운로드 중입니다.")
             return
-        targets = [item for item in self._selected_targets() if item.get("status") != "완료"]
+        targets = [
+            item for item in self._selected_targets()
+            if item.get("status") not in {"완료", "재인증 필요"}
+        ]
         if not targets:
+            reauth = [item for item in self._selected_targets() if item.get("status") == "재인증 필요"]
+            if reauth:
+                self._notify("다시 인증해야 받을 수 있습니다.")
+                self._set_phase("재인증 필요")
+                return
             selected = self._selected_targets()
             if selected and all(item.get("status") == "완료" for item in selected):
                 self._notify("이미 완료된 항목입니다.")
@@ -1540,7 +1548,9 @@ class ShellState(QObject):
         for item_id in self._active_ids:
             row = self._model.find_id(item_id)
             statuses.append(row["status"] if row else "실패")
-        if any(status == "실패" for status in statuses):
+        if any(status == "재인증 필요" for status in statuses):
+            phase = "재인증 필요"
+        elif any(status == "실패" for status in statuses):
             phase = "실패"
         elif any(status == "취소" for status in statuses):
             phase = "취소"
@@ -1555,6 +1565,8 @@ class ShellState(QObject):
             self._notify(f"{saved}개 파일을 저장했습니다.")
         elif phase == "취소":
             self._notify("다운로드를 취소했습니다.")
+        elif phase == "재인증 필요":
+            self._notify("다시 인증해야 이어서 받을 수 있습니다.")
         else:
             self._notify("일부 이미지를 저장하지 못했습니다.")
 
