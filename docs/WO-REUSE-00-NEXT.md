@@ -43,7 +43,66 @@
 - 쿠키 파일이 ACL 실패 시 사라지는 기존 동작이 유지된다.
 - 재개가 임시 URL로 이어지고, 완료 뒤에 그 파일이 없다.
 
-예상: 1~2일.
+예상: 1~2일. 아래 추가 검증이 끝나기 전에는 이 일로 완료를 적지 않는다.
+
+### 추가 필수 검증
+
+위 구현 문단은 유지한다. 아래 8개는 그 위에 더해지는 완료 조건이다. 더 좁은 조건이 이전 문장과 겹치면 아래 조건을 따른다. 비밀을 쓴 뒤에 ACL을 확인하고 실패 시 지우는 순서는 허용하지 않는다. 실패 직후 서명 URL만 지우고 재개 가능 상태로 남기는 것도 허용하지 않는다.
+
+각 조건은 자동 테스트 하나로 확인한다. 테스트를 추가하지 않거나, 건너뛰거나, 실행 결과가 없으면 그 조건은 PASS가 아니다. 보고서에는 조건마다 테스트 이름, 실행 여부, 결과만 적는다. 코드를 읽고 맞을 것으로 보는 판단은 PASS가 아니다.
+
+1. 비밀정보를 기록하기 전에 디렉터리 접근권한을 제한한다. ACL 검증에 실패하면 비밀정보를 기록하지 않는다.
+
+   서명 URL을 담는 디렉터리와 기존 세션 디렉터리 모두, 파일을 만들기 전에 제한하고 그 결과를 확인한다. 확인에 실패하면 비밀 파일을 만들지 않는다. 빈 디렉터리가 남으면 지운다.
+   테스트 `test_secret_is_not_written_when_acl_check_fails`: 제한 함수가 실패하면 서명 쿼리와 쿠키 값이 디스크에 없다.
+   Windows에서는 같은 테스트가 실제 `icacls` 경로를 한 번 탄다. 그 실행이 없으면 이 조건은 PASS가 아니다. 모의 객체만 통과한 결과는 PASS로 적지 않는다.
+
+2. SQLite의 `page_url`, `media_url`, `original_url`, `thumbnail_url`, `media_reference`, `error`, `note`를 검사한다. 이외의 URL 저장 경로도 확인한다.
+
+   현재 스키마에서 함께 검사할 경로는 `jobs.page_url`, `media_items`의 `reasons`, `saved_path`, `part_path`, `title`, `subtitles`, `format`, `classification`, `host_status.host`다. 마이그레이션이 `media_url`을 `original_url`과 `media_reference`로 복사하는 경로도 포함한다.
+   SQLite 밖의 경로도 같은 테스트에서 확인한다. 진행 JSON, `.umd-cancel`, `.umd-video-*`, `.umd-progress-*`, 자식 프로세스에 넘기는 페이로드, 로그로 남기는 예외 문자열이다.
+   테스트 `test_signed_query_is_absent_from_sqlite_and_other_stores`: 위 컬럼과 파일을 모두 읽어 서명 쿼리, 쿠키 값, Authorization 값이 없음을 확인한다. 목록에 없는 문자 컬럼이 더 있으면 그 컬럼도 검사하고 보고서에 이름을 적는다.
+
+3. 쿼리를 제거하더라도 서로 다른 원본 항목의 식별자가 충돌하지 않게 한다.
+
+   경로가 같고 서명 쿼리만 다른 두 항목은 마이그레이션 뒤에도 두 행이다. `item_id`는 서로 다르고, 각 행의 `job_id`는 원래 잡을 가리킨다. 쿼리를 뺀 URL만으로 행을 합치지 않는다.
+   테스트 `test_distinct_signed_items_keep_separate_ids`.
+
+4. 실패 또는 재시작 후 서명 URL을 다시 확보할 수 있는지 검증한다. 복구할 수 없는 작업은 재인증 필요 상태로 구분한다.
+
+   라이브러리를 닫았다 연 뒤, 서명 URL을 다시 읽을 수 있는 항목만 재개를 시도한다. 읽을 수 없으면 상태는 `재인증 필요`다. 그 상태를 `실패`, `취소`, `완료`, `일시정지`, `다운로드 중`과 같은 값으로 두지 않고, 재개를 시작하지 않는다.
+   페이지 URL만으로 추출기를 다시 호출해 받는 경로는 그 사실을 테스트가 구분한다. 이전 서명 쿼리를 SQLite에 다시 쓰지 않는다.
+   테스트 `test_restart_reauth_when_signed_url_cannot_be_restored`. 복구되는 경우와 복구되지 않는 경우를 한 테스트 안에 각각 단정한다.
+
+5. 자식 프로세스의 stdout, stderr, 예외 문자열에 비밀정보가 노출되지 않게 한다.
+
+   `src/umd/net/child.py`는 실패 시 stdout JSON에 `error`와 `trace`를 쓴다. 구현 뒤에는 그 문자열과 stderr에 서명 쿼리, 쿠키 값, Authorization 값이 없어야 한다.
+   테스트 `test_child_stdio_and_exceptions_omit_secrets`: `python -m umd.net.child`를 실제로 띄우고 stdout과 stderr를 모두 캡처한다. 예외 객체의 문자열도 별도로 확인한다. 부모 프로세스 안에서 함수만 호출하고 파이프를 보지 않은 결과는 이 조건의 PASS가 아니다.
+
+6. 기존 SQLite 데이터 마이그레이션에서 행과 작업 관계를 보존한다.
+
+   비밀이 들어 있는 기존 버전 데이터베이스를 연다. `jobs`와 `media_items`의 행 수, `jobs.id`, `media_items.id`, `media_items.job_id`는 그대로다. 행을 삭제하거나 잡에 다시 붙이지 않는다. 검사 대상 문자열에서 비밀만 제거한다.
+   테스트 `test_migration_keeps_job_item_links_while_removing_secrets`.
+
+7. SQLite WAL과 기존 백업에 남을 수 있는 비밀정보의 처리 범위를 별도로 보고한다.
+
+   현재 `Library`는 `journal_mode`를 WAL로 바꾸지 않고, 백업을 만드는 코드도 없다. 이 사실은 테스트로 확인한다. 확인해도 본 데이터베이스에서 비밀이 사라졌다는 결과와 묶어서 PASS로 적지 않는다.
+   테스트 `test_wal_and_backup_scope_is_reported`: 연 연결의 `journal_mode`, 옆에 생긴 `-wal`과 `-shm`, 테스트가 일부러 만들어 둔 복사본을 기록한다. 마이그레이션이 본 파일만 고치고 WAL 파일과 복사본을 수정하지 않으면 보고서는 `본 데이터베이스`와 `WAL·백업`을 따로 적는다. 복사본에 비밀이 남아 있으면 WAL·백업 범위는 PASS가 아니다. 파일을 검사하지 않았으면 NOT RUN이다.
+
+8. 기존 세션 쿠키, 다운로드 재개, S4 취소·종료 동작을 유지한다.
+
+   다음 기존 테스트를 수정하지 않고 다시 실행한다.
+   - `tests/unit/test_wo04s.py::test_cookie_scope_expiry_and_leftover_files`
+   - `tests/unit/test_wo04s.py::test_failed_acl_does_not_keep_the_session`
+   - `tests/unit/test_wo04_browser.py::test_sessions_stay_on_their_site_and_out_of_sqlite`
+   - `tests/unit/test_wo02_engine.py::test_range_resume_etag_change_and_non_resumable`
+   - `tests/unit/test_wo02_engine.py::test_cancel_and_pause_resume`
+   - `tests/unit/test_wo02_engine.py::test_restart_reconciles_a_finished_file_and_resumes_a_partial`
+   - `tests/unit/test_wo02_ui.py::test_ui_stays_responsive_and_pause_resumes`
+   - `tests/unit/test_wo04_s4_shutdown.py`의 종료 3건
+   쿠키는 요청에 계속 붙고, SQLite에는 계속 들어가지 않는다. Range 재개, 취소, 일시정지 후 재개, S4의 스레드 종료와 부분 파일 삭제는 유지한다. `download_one()`은 그대로 둔다.
+
+새 테스트는 `tests/unit/test_wo_reuse_01_secrets.py`에 둔다. 조건 8은 새 단정을 그 파일에 복제하지 않고 위 기존 테스트를 실행한다. 조건 1부터 7은 그 파일의 해당 테스트가 통과해야 PASS다.
 
 ## WO-REUSE-02 — 기존 엔진의 재개와 무결성
 
@@ -141,3 +200,5 @@
 ## 보고
 
 각 WO는 `docs/WO-REUSE-0N-REPORT.md`를 남긴다. 테스트 통과와 릴리스 GO를 한 문장으로 합치지 않는다. CI를 돌리면 `workflow_dispatch`만 사용하고, 실행된 `headSha`를 적는다. 기록 커밋의 SHA를 구현 SHA로 적지 않는다.
+
+WO-REUSE-01 보고서는 추가 필수 검증 8개를 각각 PASS, FAIL, NOT RUN으로 적는다. 테스트를 실행하지 않은 조건, 모의 객체만으로 대신한 ACL, 본 데이터베이스 결과만으로 넘긴 WAL·백업은 PASS가 아니다. 이 지시서의 수정만으로는 어떤 조건도 PASS가 아니다.
