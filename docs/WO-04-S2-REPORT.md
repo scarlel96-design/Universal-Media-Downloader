@@ -14,7 +14,9 @@ PR 상태: OPEN. 이 작업에서 병합하지 않았다. PR #5도 병합하지 
 
 기준 HEAD: `f9a00d36c678a634eb05537a716ad34463a1d5eb`
 
-변경 커밋: 이 문서와 코드를 담은 커밋. SHA는 다음 기록 커밋에 적는다.
+구현 커밋: `fd93f1860387f60b8989d6c5cdb4b2477811d63a`
+
+로컬 반복 실험은 이 구현을 커밋하기 전의 같은 작업 트리에서 했다. 기록 커밋은 이 SHA를 문서에 적는 차이만 있다.
 
 환경: 로컬 Windows, Python 3.12, 저장소 가상환경. CI 결과와 로컬 결과를 같은 PASS로 적지 않는다.
 
@@ -215,7 +217,9 @@ Windows에서는 `icacls /inheritance:r /grant:r {user}:(OI)(CI)F`의 종료 코
 
 ## GitHub Actions
 
-이 문서를 처음 커밋할 때는 NOT RUN이다. 푸시 후 `workflow_dispatch`로 이 브랜치를 실행하고, `headSha`가 로컬 커밋과 같은지 확인한 뒤 아래에 덧붙인다. 부하 잡은 켜지 않는다. CI가 통과해도 로컬 필수 FAIL이 있으면 GO가 아니다.
+구현 커밋 `fd93f1860387f60b8989d6c5cdb4b2477811d63a`를 푸시한 뒤 `workflow_dispatch`로 이 브랜치를 실행한다. 부하 잡은 켜지 않는다. 실행 `headSha`가 푸시한 기록 커밋과 같은지 확인한다. CI가 통과해도 로컬 필수 FAIL이 있으면 GO가 아니다.
+
+이 절의 실행 URL은 아직 NOT RUN이다. 실행이 끝나면 같은 문서에 덧붙인다.
 
 ## 잔여 항목
 
