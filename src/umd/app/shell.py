@@ -869,10 +869,29 @@ class ShellState(QObject):
         self.urlChanged.emit()
         self.countsChanged.emit()
 
-    def joinWorkers(self) -> None:
-        for thread in (self._extract_thread, self._download_thread):
-            if thread is not None and thread.isRunning():
-                thread.wait(5000)
+    def joinWorkers(self, timeout_ms: int | None = 5000) -> None:
+        # Qt aborts with 0xC0000409 (FAST_FAIL_FATAL_APP_EXIT) if this QThread
+        # is destroyed while it is still running. The default limit stays 5s.
+        # QThread.wait() on the GUI thread cannot deliver the queued
+        # thread.quit() that the worker emits, so this pumps events instead.
+        # None waits until the worker returns. Cancel does not unblock a read.
+        from PySide6.QtGui import QGuiApplication
+
+        app = QGuiApplication.instance()
+        deadline = None if timeout_ms is None else time.monotonic() + (timeout_ms / 1000)
+        while True:
+            running = [
+                thread
+                for thread in (self._extract_thread, self._download_thread)
+                if thread is not None and thread.isRunning()
+            ]
+            if not running:
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            if app is not None:
+                app.processEvents()
+            time.sleep(0.02)
 
     @Slot()
     def toggleTheme(self) -> None:

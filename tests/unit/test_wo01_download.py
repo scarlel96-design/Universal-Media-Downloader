@@ -1,11 +1,13 @@
 import threading
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
 
 import pytest
 
 from umd.download.images import download_one
 from umd.storage.database import SCHEMA_VERSION, Library
-from wo01_support import EXPECTED, PHOTOS, base_url, serve
+from wo01_support import EXPECTED, PHOTOS, ProbeServer, base_url, serve
 
 
 @pytest.fixture(scope="module")
@@ -57,9 +59,106 @@ def test_11_http_errors_and_corrupt_bodies_leave_no_file(server, tmp_path: Path)
     assert missing.status == "실패" and missing.error.startswith("HTTP 404")
     assert boom.status == "실패" and boom.error.startswith("HTTP 500")
     assert corrupt.status == "실패" and "형식" in corrupt.error
-    assert short.status == "실패" and "잘렸" in short.error
+    assert short.status == "실패" and short.path == "" and short.size == 0
+    assert "timed out" not in short.error
+    # This socket closes after a short body. On this host that is either a
+    # clean EOF ("응답이 잘렸습니다") or WinError 10054. A reset is not rewritten
+    # as a truncated body, and a timeout is not accepted as either.
+    assert ("잘렸" in short.error) or ("10054" in short.error)
     assert refused.status == "실패" and "허용되지 않은" in refused.error
     assert list(tmp_path.iterdir()) == []
+    for result in (missing, boom, corrupt, short, refused):
+        assert result.status != "완료"
+        assert result.path == ""
+        assert result.size == 0
+
+
+def _failed_clean(result, folder: Path) -> None:
+    assert result.status == "실패"
+    assert result.status != "완료"
+    assert result.path == ""
+    assert result.size == 0
+    assert list(folder.iterdir()) == []
+    assert list(folder.glob("*.part")) == []
+
+
+def _observe_eof_gap(url: str, sent: int) -> tuple[int, int]:
+    """Return (declared, received) for one clean short read.
+
+    A reset is not treated as a short read. A few attempts are allowed because
+    this host sometimes answers the same close with WinError 10054.
+    """
+
+    last = "no response"
+    for _ in range(8):
+        try:
+            with urlopen(url, timeout=2) as response:
+                declared = int(response.headers["Content-Length"])
+                first = response.read(64 * 1024)
+                second = response.read(64 * 1024)
+        except URLError as exc:
+            last = str(exc.reason)
+            continue
+        except Exception as exc:
+            last = str(exc)
+            continue
+        if second == b"" and declared == sent + 40 and len(first) == sent:
+            return declared, len(first)
+        last = f"declared={declared} first={len(first)} second={len(second)}"
+    raise AssertionError(last)
+
+
+def test_eof_short_body_reports_truncation_and_keeps_no_file(tmp_path: Path):
+    sent = (PHOTOS / "dot.png").read_bytes()
+    probe = ProbeServer("eof")
+    try:
+        declared, received = _observe_eof_gap(probe.url(), len(sent))
+        assert declared - received == 40
+        result = download_one(probe.url(), tmp_path)
+    finally:
+        probe.shutdown()
+    assert result.error == "응답이 잘렸습니다"
+    _failed_clean(result, tmp_path)
+
+
+def test_tcp_reset_stays_a_reset_and_keeps_no_file(tmp_path: Path):
+    probe = ProbeServer("rst")
+    try:
+        result = download_one(probe.url(), tmp_path, timeout=2)
+    finally:
+        probe.shutdown()
+    assert "잘렸" not in result.error
+    assert "timed out" not in result.error
+    assert "10054" in result.error
+    _failed_clean(result, tmp_path)
+
+
+def test_stalled_response_stays_a_timeout_and_keeps_no_file(tmp_path: Path):
+    probe = ProbeServer("stall", hold=3)
+    try:
+        result = download_one(probe.url(), tmp_path, timeout=1)
+    finally:
+        probe.shutdown()
+    assert result.error == "timed out"
+    assert "잘렸" not in result.error
+    assert "10054" not in result.error
+    _failed_clean(result, tmp_path)
+
+
+def test_matching_content_length_saves_the_file(tmp_path: Path):
+    sent = (PHOTOS / "dot.png").read_bytes()
+    probe = ProbeServer("ok")
+    try:
+        result = download_one(probe.url(), tmp_path)
+    finally:
+        probe.shutdown()
+    assert result.status == "완료", result.error
+    assert result.error == ""
+    assert result.size == len(sent)
+    saved = Path(result.path)
+    assert saved.is_file()
+    assert saved.read_bytes() == sent
+    assert list(tmp_path.glob("*.part")) == []
 
 
 def test_cancel_does_not_keep_a_partial_file(server, tmp_path: Path):

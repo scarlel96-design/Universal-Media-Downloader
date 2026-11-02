@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import threading
 import time
@@ -46,11 +47,12 @@ def _record(url: str, **kwargs) -> MediaRecord:
 
 
 class _Origin:
-    """Small local origin that half-closes after the body.
+    """Local origin for the browser tests.
 
-    The download lab waits for the client to close first. A browser proxy
-    waits for the origin to close, so those two waits would stall the
-    navigation. This server finishes the write side itself.
+    Local extraction reads the body with urllib and then fulfills the route.
+    urllib stops at Content-Length, then closes. This server waits for that
+    close. shutdown(SHUT_WR) before the close reset some of those reads on
+    this host, and the route abort surfaced as net::ERR_FAILED.
     """
 
     def __init__(self) -> None:
@@ -103,10 +105,6 @@ class _Origin:
                 f"Content-Type: {content_type}\r\nConnection: close\r\n\r\n"
             ).encode("ascii")
             connection.sendall(head + body)
-            try:
-                connection.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
             connection.settimeout(2)
             try:
                 while connection.recv(4096):
@@ -307,10 +305,42 @@ def test_analyze_returns_before_a_slow_page_finishes(tmp_path: Path):
     assert shell.theme == "dark"
 
 
+def _trace_browser(log_path: Path) -> None:
+    import umd.extract.browser as browser
+
+    if getattr(browser, "_wo04s3_traced", False):
+        return
+    original = browser.arm_page
+
+    def arm(page, network_mode: str) -> None:
+        original(page, network_mode)
+
+        def write(kind: str, url: str, detail: str = "") -> None:
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{time.monotonic():.3f}\t{kind}\t{url}\t{detail}\n")
+                handle.flush()
+
+        page.on("request", lambda request: write("request", request.url))
+        page.on("response", lambda response: write("response", response.url, str(response.status)))
+        page.on("requestfailed", lambda request: write("requestfailed", request.url, str(request.failure or "")))
+        page.on("requestfinished", lambda request: write("requestfinished", request.url))
+
+    browser.arm_page = arm
+    browser._wo04s3_traced = True
+
+
 def test_javascript_images_spa_lazy_scroll_and_cleanup(pages, chromium):
     from umd.extract.browser import extract_dynamic
     from umd.extract.router import extract_page
 
+    trace = os.environ.get("WO04S3_LAZY_LOG", "")
+    if trace:
+        path = Path(trace)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _trace_browser(path)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.monotonic():.3f}\tfixture\t{pages.url('/lazy.html')}\tready\n")
+            handle.flush()
     PolicyProxy.denied_all.clear()
     added = extract_page(pages.url("/js-added.html"), network_mode="local")
     assert extraction_succeeded(added)
@@ -321,7 +351,16 @@ def test_javascript_images_spa_lazy_scroll_and_cleanup(pages, chromium):
     second = extract_dynamic(pages.url("/spa.html") + "#/post/2")
     assert _names(first) == ["post-1.png"]
     assert _names(second) == ["post-2.png"]
-    lazy = extract_dynamic(pages.url("/lazy.html"))
+    lazy_url = pages.url("/lazy.html")
+    if trace:
+        with Path(trace).open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.monotonic():.3f}\tgoto\t{lazy_url}\tcall\n")
+            handle.flush()
+    lazy = extract_dynamic(lazy_url)
+    if trace:
+        with Path(trace).open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.monotonic():.3f}\tgoto\t{lazy_url}\treturned\n")
+            handle.flush()
     assert _names(lazy) == ["lazy.png"]
     scrolled = extract_dynamic(pages.url("/scroll.html"))
     assert _names(scrolled) == ["scroll-1.png", "scroll-2.png", "scroll-3.png"]

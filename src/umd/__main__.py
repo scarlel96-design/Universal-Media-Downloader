@@ -26,8 +26,11 @@ def main() -> int:
     engine.load(QUrl.fromLocalFile(str(qml)))
     if not engine.rootObjects():
         return 1
-    app.aboutToQuit.connect(bundle.shell.cancelDownload)
-    app.aboutToQuit.connect(bundle.shell.joinWorkers)
+    def _stop_workers() -> None:
+        bundle.shell.cancelDownload()
+        bundle.shell.joinWorkers(None)
+
+    app.aboutToQuit.connect(_stop_workers)
     return app.exec()
 
 
