@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import socket
+import struct
 import threading
 import time
 from pathlib import Path
@@ -49,7 +50,7 @@ class FixtureServer:
         while not self._stop.is_set():
             try:
                 self._socket.settimeout(0.2)
-                connection, _address = self._socket.accept()
+                connection, address = self._socket.accept()
             except TimeoutError:
                 continue
             except OSError:
@@ -80,12 +81,23 @@ class FixtureServer:
                 "Connection: close\r\n\r\n"
             )
             connection.sendall(head.encode("ascii") + body)
+            short = declared is not None and declared > len(body)
+            if short:
+                # The request is already consumed. Closing now is either a
+                # clean EOF of the bytes just written, or WinError 10054.
+                # shutdown(SHUT_WR) before the close made some clients wait
+                # out their timeout. Pausing before the close turned the EOF
+                # cases into resets. Those two are not collapsed into one error.
+                return
+            # A complete body stays open until the client closes. Shutting the
+            # write side first makes recv return empty at once on this host,
+            # and the following close can drop bytes the client has not read.
+            connection.settimeout(5)
             try:
-                connection.shutdown(socket.SHUT_WR)
+                while connection.recv(1024):
+                    pass
             except OSError:
                 return
-            while connection.recv(1024):
-                pass
         except OSError:
             return
         finally:
@@ -103,6 +115,112 @@ class FixtureServer:
 
     def server_close(self) -> None:
         self.shutdown()
+
+
+class ProbeServer:
+    """One local behavior for an error-classification test.
+
+    ``eof`` declares a longer body and finishes the write side.
+    ``rst`` aborts the socket after a partial body.
+    ``stall`` accepts the request and does not answer.
+    ``ok`` sends one complete PNG.
+    """
+
+    def __init__(self, mode: str, *, hold: float = 0.0) -> None:
+        if mode not in {"eof", "rst", "stall", "ok"}:
+            raise ValueError(mode)
+        self.mode = mode
+        self.hold = hold
+        ensure_photos()
+        self._body = (PHOTOS / "dot.png").read_bytes()
+        self._lock = threading.Lock()
+        self._next_id = 0
+        self.sockets: list[dict[str, object]] = []
+        self._socket = socket.create_server(("127.0.0.1", 0), backlog=32)
+        self.port = int(self._socket.getsockname()[1])
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._accept, name="wo01-probe", daemon=True)
+        self._thread.start()
+
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/dot.png"
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        try:
+            self._socket.close()
+        except OSError:
+            return
+
+    def _accept(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._socket.settimeout(0.2)
+                connection, address = self._socket.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._client, args=(connection,), daemon=True).start()
+
+    def _client(self, connection: socket.socket) -> None:
+        with self._lock:
+            self._next_id += 1
+            record: dict[str, object] = {
+                "id": self._next_id,
+                "peer_port": None,
+                "mode": self.mode,
+            }
+            self.sockets.append(record)
+        try:
+            record["peer_port"] = connection.getpeername()[1]
+        except OSError:
+            record["peer_port"] = None
+        try:
+            connection.settimeout(2)
+            raw = b""
+            while b"\r\n\r\n" not in raw and len(raw) < 16384:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    return
+                raw += chunk
+            body = self._body
+            if self.mode == "stall":
+                time.sleep(self.hold)
+                return
+            if self.mode == "rst":
+                head = (
+                    "HTTP/1.0 200 OK\r\nContent-Type: image/png\r\n"
+                    f"Content-Length: {len(body) + 40}\r\nConnection: close\r\n\r\n"
+                ).encode("ascii")
+                connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("hh", 1, 0))
+                connection.sendall(head + body[:20])
+                return
+            if self.mode == "eof":
+                head = (
+                    "HTTP/1.0 200 OK\r\nContent-Type: image/png\r\n"
+                    f"Content-Length: {len(body) + 40}\r\nConnection: close\r\n\r\n"
+                ).encode("ascii")
+                connection.sendall(head + body)
+                return
+            head = (
+                "HTTP/1.0 200 OK\r\nContent-Type: image/png\r\n"
+                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+            ).encode("ascii")
+            connection.sendall(head + body)
+            connection.settimeout(2)
+            try:
+                while connection.recv(1024):
+                    pass
+            except OSError:
+                return
+        except OSError:
+            return
+        finally:
+            try:
+                connection.close()
+            except OSError:
+                return
 
 
 def _file_under_posts(path: str) -> Path | None:

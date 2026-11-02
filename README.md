@@ -26,4 +26,4 @@ $env:PYTHONPATH = "src"
 
 ## 현재 판정
 
-WO-00 심층 역분석은 BLOCKED이고, 성능 비교는 NOT RUN이다. WO-01과 WO-02 기준선은 GO다. WO-GIT-00은 이 저장소의 `main`으로 그 기준선을 이관했다. WO-03 판정과 측정값은 `docs/WO-03-REPORT.md`에 있다. GitHub Actions 워크플로는 수동 실행만 두고, 실행 전에는 CI PASS로 적지 않는다.
+WO-00 심층 역분석은 BLOCKED이고, 성능 비교는 NOT RUN이다. WO-01과 WO-02 기준선은 GO다. WO-GIT-00은 이 저장소의 `main`으로 그 기준선을 이관했다. WO-03 판정과 측정값은 `docs/WO-03-REPORT.md`에 있다. WO-04 측정과 판정은 `docs/WO-04-REPORT.md`에 있다. GitHub Actions 워크플로는 수동 실행만 두고, 실행 전에는 CI PASS로 적지 않는다. 프로젝트 LICENSE 파일은 없고, 정식 공개 릴리스는 NO-GO다.

@@ -191,6 +191,11 @@ Rectangle {
             required property string note
             width: grid.cellWidth
             height: grid.cellHeight
+            opacity: 1
+            Behavior on opacity {
+                enabled: !shell.reduceMotion
+                NumberAnimation { duration: 150; easing.type: Easing.OutCubic }
+            }
             onStatusChanged: {
                 if (status !== "완료")
                     return
@@ -210,6 +215,10 @@ Rectangle {
                 color: Qt.hsla(hue / 360, 0.45, shell.theme === "dark" ? 0.35 : 0.62, 1)
                 border.color: selected ? ink.accent : "transparent"
                 border.width: 2
+                Behavior on border.width {
+                    enabled: !shell.reduceMotion
+                    NumberAnimation { duration: 170; easing.type: Easing.OutCubic }
+                }
                 scale: cardArea.containsMouse && !shell.reduceMotion ? 1.015 : 1
                 Accessible.role: Accessible.CheckBox
                 Accessible.name: title + (kind === "video" ? " 영상" : " 이미지")

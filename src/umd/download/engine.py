@@ -10,11 +10,14 @@ from __future__ import annotations
 import asyncio
 import heapq
 import json
+import linecache
 import os
+import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
@@ -31,6 +34,21 @@ _RESTART = "restart"
 _PAUSED = "paused"
 _CANCEL = "cancel"
 _DONE = "done"
+_close_guard_installed = False
+shutdown_10022_events: list[str] = []
+
+
+def _video_kind(url: str, head: bytes) -> str | None:
+    """Accept a direct video only when the suffix and the file header agree."""
+
+    suffix = PurePosixPath(urlsplit(url).path).suffix.lower()
+    if suffix == ".mp4" and b"ftyp" in head[:32]:
+        return "mp4"
+    if suffix == ".webm" and head.startswith(b"\x1a\x45\xdf\xa3"):
+        return "webm"
+    if suffix in {".ogv", ".ogg"} and head.startswith(b"OggS"):
+        return suffix.lstrip(".")
+    return None
 
 
 @dataclass
@@ -203,6 +221,10 @@ class DownloadEngine:
         self._resume.set()
         for task in list(self._tasks.values()):
             task.cancel()
+        # A stalled read does not see the flag until the next chunk. Closing
+        # the live socket lets that read raise so this task can exit. This is
+        # not QThread.terminate; the worker thread returns on its own.
+        _close_live_sockets(self._client)
 
     def request_cancel_one(self, item_id: str) -> None:
         self._cancel_ids.add(item_id)
@@ -223,6 +245,7 @@ class DownloadEngine:
         await self._hosts.retarget(per_host)
 
     async def run(self) -> None:
+        install_windows_socket_close()
         if not self.directory.is_dir():
             for item in self.items:
                 self._emit(item, status="실패", error="저장 경로가 올바르지 않습니다", terminal=True)
@@ -263,6 +286,9 @@ class DownloadEngine:
                 await self._schedule()
             finally:
                 self._client = None
+        # The client closes the pool before this line. One more loop turn lets
+        # the proactor finish socket shutdown while the loop is still open.
+        await asyncio.sleep(0)
         self.peak_connections = self._global.peak
 
     async def _schedule(self) -> None:
@@ -444,8 +470,12 @@ class DownloadEngine:
         try:
             return await self._http(item, url, host, depth=0)
         except httpx.TimeoutException:
+            if self._stopped(item.item_id):
+                return self._cancelled(item)
             return _Outcome(_RETRY, delay=self._backoff(item), error="시간이 초과되었습니다")
         except httpx.TransportError as exc:
+            if self._stopped(item.item_id):
+                return self._cancelled(item)
             return _Outcome(_RETRY, delay=self._backoff(item), error=_safe_transport(exc))
 
     def _backoff(self, item: DownloadItem) -> float:
@@ -466,6 +496,11 @@ class DownloadEngine:
                 headers["If-Range"] = item.etag
             elif item.last_modified:
                 headers["If-Range"] = item.last_modified
+        from umd.auth.session import cookie_header
+
+        cookie = cookie_header(url)
+        if cookie:
+            headers["Cookie"] = cookie
         response = await self._client.send(self._client.build_request("GET", url, headers=headers), stream=True)
         try:
             status = response.status_code
@@ -603,6 +638,9 @@ class DownloadEngine:
                         item.last_modified = modified
                     self._maybe_progress(item, response.status_code)
         except httpx.TransportError:
+            # Cancel closes the socket. That raise is not a short body.
+            if self._stopped(item.item_id):
+                return self._cancelled(item)
             self._truncate_part(part, append_at)
             item.downloaded = append_at
             return _Outcome(_RETRY, delay=self._backoff(item), error="응답이 잘렸습니다", http_status=response.status_code)
@@ -662,7 +700,10 @@ class DownloadEngine:
             self._discard(item)
             return _Outcome(_PERMANENT, error="빈 응답", http_status=http_status)
         with part.open("rb") as handle:
-            kind = sniff_image(handle.read(16))
+            head = handle.read(32)
+        kind = sniff_image(head)
+        if kind is None:
+            kind = _video_kind(item.url, head)
         if kind is None:
             self._discard(item)
             return _Outcome(_PERMANENT, error="허용되지 않은 이미지 형식", http_status=http_status)
@@ -774,6 +815,14 @@ class DownloadEngine:
         item.status = status
         self._on_event(event)
 
+    def _stopped(self, item_id: str) -> bool:
+        return self._cancel_all or item_id in self._cancel_ids
+
+    def _cancelled(self, item: DownloadItem) -> _Outcome:
+        self._discard(item)
+        self._finish_cancel(item)
+        return _Outcome(_CANCEL)
+
     def _finish_cancel(self, item: DownloadItem) -> None:
         if item.status == "취소":
             return
@@ -795,6 +844,103 @@ class DownloadEngine:
                 handle.truncate(size)
         except OSError:
             pass
+
+
+def _close_live_sockets(client: object | None) -> None:
+    """Unblock reads that are waiting on a socket this client still owns."""
+
+    transport = getattr(client, "_transport", None)
+    pool = getattr(transport, "_pool", None) if transport is not None else None
+    if pool is None:
+        return
+    try:
+        connections = list(pool.connections)
+    except Exception:
+        return
+    for connection in connections:
+        inner = getattr(connection, "_connection", None)
+        stream = getattr(inner, "_network_stream", None)
+        if stream is None:
+            continue
+        try:
+            sock = stream.get_extra_info("socket")
+        except Exception:
+            continue
+        if sock is None:
+            continue
+        # asyncio wraps the socket and refuses close(). The raw socket is what
+        # the stalled read is waiting on.
+        raw = getattr(sock, "_sock", sock)
+        try:
+            raw.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            raw.close()
+        except OSError:
+            continue
+
+
+def install_windows_socket_close() -> None:
+    """Close the socket even when Windows rejects shutdown with WinError 10022.
+
+    CPython's proactor calls ``shutdown(SHUT_RDWR)`` and only then ``close()``.
+    On this host the lab server has already shut the socket, so shutdown raises
+    10022 and ``close()`` never runs. The download task has already finished;
+    this guard only wraps that callback. Any other 10022 still propagates.
+    """
+
+    global _close_guard_installed
+    if _close_guard_installed or sys.platform != "win32":
+        return
+    from asyncio import proactor_events
+
+    original = proactor_events._ProactorBasePipeTransport._call_connection_lost
+
+    def _call_connection_lost(self, exc):
+        try:
+            original(self, exc)
+        except OSError as err:
+            _finish_proactor_socket(self)
+            if _is_proactor_shutdown_10022(err):
+                shutdown_10022_events.append("proactor-shutdown")
+                return
+            raise
+
+    proactor_events._ProactorBasePipeTransport._call_connection_lost = _call_connection_lost
+    _close_guard_installed = True
+
+
+def _finish_proactor_socket(transport) -> None:
+    sock = getattr(transport, "_sock", None)
+    if sock is not None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        transport._sock = None
+    server = getattr(transport, "_server", None)
+    if server is not None:
+        try:
+            server._detach()
+        except Exception:
+            pass
+        transport._server = None
+    transport._called_connection_lost = True
+
+
+def _is_proactor_shutdown_10022(err: BaseException) -> bool:
+    if not isinstance(err, OSError) or getattr(err, "winerror", None) != 10022:
+        return False
+    traceback = err.__traceback__
+    while traceback is not None:
+        code = traceback.tb_frame.f_code
+        if code.co_name == "_call_connection_lost" and code.co_filename.endswith("proactor_events.py"):
+            line = linecache.getline(code.co_filename, traceback.tb_lineno)
+            if "shutdown" in line:
+                return True
+        traceback = traceback.tb_next
+    return False
 
 
 async def _close_quietly(response: httpx.Response) -> None:

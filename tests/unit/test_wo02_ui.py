@@ -9,6 +9,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 
 from umd.app.shell import ShellBundle
+from shell_hold import hold_shell
 from wo02_support import PNG, LabServer, Reply
 
 QML = Path(__file__).resolve().parents[2] / "src" / "umd" / "ui" / "qml" / "Main.qml"
@@ -47,6 +48,7 @@ def open_shell(qt_app, db_path: Path):
     assert roots, "QML failed to load"
     win = roots[0]
     qt_app.processEvents()
+    hold_shell(bundle, engine, win)
     return bundle, engine, win
 
 

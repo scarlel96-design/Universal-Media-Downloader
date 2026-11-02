@@ -7,6 +7,7 @@ on the original item and is not saved as a second file.
 from __future__ import annotations
 
 import io
+import os
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit, urljoin
 
@@ -47,6 +48,12 @@ def _disable_proxy() -> None:
 
 
 def extract_gallery(url: str) -> ExtractResult:
+    if os.environ.get("UMD_IN_WORKER") != "1":
+        require_public(url)
+        from umd.extract.model import result_from_payload
+        from umd.net.isolated import call
+
+        return result_from_payload(call("gallery-extract", {"url": url}))
     import gallery_dl
     from gallery_dl.extractor.message import Message
     from gallery_dl.job import DataJob

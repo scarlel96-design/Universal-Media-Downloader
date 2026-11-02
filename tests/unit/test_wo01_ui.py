@@ -10,6 +10,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 from umd.app.shell import ShellBundle
 from umd.storage.database import SCHEMA_VERSION
 from wo01_support import EXPECTED, PHOTOS, base_url, serve
+from shell_hold import hold_shell
 
 QML = Path(__file__).resolve().parents[2] / "src" / "umd" / "ui" / "qml" / "Main.qml"
 
@@ -49,6 +50,7 @@ def open_shell(qt_app, db_path: Path):
     win = roots[0]
     qt_app.processEvents()
     assert win.property("hostMode") == "native-frame"
+    hold_shell(bundle, engine, win)
     return bundle, engine, win
 
 

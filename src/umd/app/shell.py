@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections import deque
+from pathlib import Path
+from urllib.parse import urlsplit
 
 from PySide6.QtCore import (
     Property,
@@ -535,6 +538,7 @@ class ShellState(QObject):
     reduceMotionChanged = Signal()
     countsChanged = Signal()
     detailChanged = Signal()
+    previewChanged = Signal()
     toastChanged = Signal()
     urlChanged = Signal()
     jobPhaseChanged = Signal()
@@ -567,6 +571,12 @@ class ShellState(QObject):
         self._detail_kind = CATALOG[0].kind
         self._detail_hue = CATALOG[0].hue
         self._detail_preview = ""
+        self._preview_source = ""
+        self._preview_note = ""
+        self._preview_muted = True
+        self._preview_playing = False
+        self._detail_fetch = ""
+        self._detail_saved = ""
         self._detail_source = "시안 데이터"
         self._detail_relevance = "본문 미디어(예시)"
         self._detail_status = "다운로드 미연결"
@@ -602,6 +612,7 @@ class ShellState(QObject):
         self._extract_worker: ExtractWorker | None = None
         self._download_thread: QThread | None = None
         self._download_worker: DownloadWorker | None = None
+        self._quitting = False
         model.dataChanged.connect(lambda *_: self.countsChanged.emit())
         proxy.modelReset.connect(self.countsChanged.emit)
         proxy.layoutChanged.connect(self.countsChanged.emit)
@@ -663,6 +674,26 @@ class ShellState(QObject):
     @Property(str, notify=detailChanged)
     def detailPreview(self) -> str:
         return self._detail_preview
+
+    @Property(bool, notify=detailChanged)
+    def detailIsVideo(self) -> bool:
+        return self._detail_kind == "video" and not self._using_samples
+
+    @Property(str, notify=previewChanged)
+    def previewSource(self) -> str:
+        return self._preview_source
+
+    @Property(str, notify=previewChanged)
+    def previewNote(self) -> str:
+        return self._preview_note
+
+    @Property(bool, notify=previewChanged)
+    def previewMuted(self) -> bool:
+        return self._preview_muted
+
+    @Property(bool, notify=previewChanged)
+    def previewPlaying(self) -> bool:
+        return self._preview_playing
 
     @Property(str, notify=detailChanged)
     def detailSource(self) -> str:
@@ -839,10 +870,48 @@ class ShellState(QObject):
         self.urlChanged.emit()
         self.countsChanged.emit()
 
-    def joinWorkers(self) -> None:
-        for thread in (self._extract_thread, self._download_thread):
-            if thread is not None and thread.isRunning():
-                thread.wait(5000)
+    def joinWorkers(self, timeout_ms: int | None = 5000) -> None:
+        # Qt aborts with 0xC0000409 (FAST_FAIL_FATAL_APP_EXIT) if this QThread
+        # is destroyed while it is still running. The default limit stays 5s.
+        # QThread.wait() on the GUI thread cannot deliver the queued
+        # thread.quit() that the worker emits, so this pumps events instead.
+        # None waits until the worker returns. It does not call
+        # QThread.terminate. shutdownForQuit() cancels first and closes a
+        # stalled socket so the worker can return. A video child that has
+        # not acknowledged cancel still keeps this wait alive.
+        from PySide6.QtGui import QGuiApplication
+
+        app = QGuiApplication.instance()
+        deadline = None if timeout_ms is None else time.monotonic() + (timeout_ms / 1000)
+        while True:
+            running = [
+                thread
+                for thread in (self._extract_thread, self._download_thread)
+                if thread is not None and thread.isRunning()
+            ]
+            if not running:
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            if app is not None:
+                app.processEvents()
+            time.sleep(0.02)
+
+    @Slot()
+    def shutdownForQuit(self) -> None:
+        """Cancel current work and show that the window is waiting for it.
+
+        A second call does not start another job. The worker thread is left
+        running until it returns.
+        """
+
+        self._quitting = True
+        self.cancelDownload()
+        self._phase = "종료 중"
+        self._status_line = "종료를 기다리는 중"
+        self._banner = "종료를 기다리는 중"
+        self.jobPhaseChanged.emit()
+        self.notesChanged.emit()
 
     @Slot()
     def toggleTheme(self) -> None:
@@ -951,13 +1020,23 @@ class ShellState(QObject):
         self._detail_meta = ""
         if not fetch:
             self._detail_preview = ""
+            self._detail_fetch = ""
+            self._detail_saved = ""
+            self._preview_source = ""
+            self._preview_note = ""
+            self._preview_playing = False
+            self.previewChanged.emit()
             self._detail_source = "시안 데이터"
             self._detail_relevance = "본문 미디어(예시)"
             self._detail_status = "다운로드 미연결"
             self._detail_reasons = ""
         else:
             classification = item.get("classification") or "uncertain"
+            self._detail_fetch = fetch
+            self._detail_saved = str(item.get("savedPath") or item.get("path") or "")
             self._detail_preview = item.get("previewUrl") or ""
+            self._guard_authed_preview(fetch)
+            self._arm_preview(item)
             self._detail_source = item.get("mediaUrl") or fetch
             self._detail_relevance = CLASS_LABELS.get(classification, classification)
             self._detail_status = item.get("status") or "대기"
@@ -971,6 +1050,105 @@ class ShellState(QObject):
                 if choice.get("id")
             ]
         self.detailChanged.emit()
+
+    def _guard_authed_preview(self, fetch: str) -> None:
+        from umd.auth.session import cookie_header
+
+        if cookie_header(fetch) or cookie_header(self._detail_preview):
+            self._detail_preview = ""
+            self._preview_note = "인증된 미디어는 저장과 같은 세션으로만 미리봅니다"
+
+    def _arm_preview(self, item: dict) -> None:
+        self._preview_playing = False
+        self._preview_source = ""
+        if item.get("kind") != "video":
+            if "인증된" not in self._preview_note:
+                self._preview_note = ""
+        elif "인증된" not in self._preview_note:
+            self._preview_note = "재생을 누르면 허용된 영상의 앞부분을 미리 봅니다."
+        self.previewChanged.emit()
+
+    def _preview_target(self) -> str:
+        saved = self._detail_saved
+        if saved and Path(saved).is_file():
+            return Path(saved).as_uri()
+        parts = urlsplit(self._detail_fetch or "")
+        host = (parts.hostname or "").lower()
+        if parts.scheme == "file":
+            return self._detail_fetch
+        if parts.scheme in {"http", "https"} and host in {"127.0.0.1", "localhost"}:
+            return self._detail_fetch
+        return ""
+
+    @Slot()
+    def playPreview(self) -> None:
+        if self._detail_kind != "video" or self._using_samples:
+            self._preview_note = "재생할 영상이 없습니다"
+            self._preview_playing = False
+            self.previewChanged.emit()
+            return
+        source = self._preview_target()
+        if not source:
+            self._preview_source = ""
+            self._preview_playing = False
+            self._preview_note = "이 영상은 미리보기를 위해 전체를 받지 않습니다. 형식을 선택한 뒤 저장하세요."
+            self.previewChanged.emit()
+            return
+        self._preview_source = source
+        self._preview_playing = True
+        self._preview_note = ""
+        self.previewChanged.emit()
+
+    @Slot()
+    def pausePreview(self) -> None:
+        self._preview_playing = False
+        self.previewChanged.emit()
+
+    @Slot()
+    def togglePreviewMute(self) -> None:
+        self._preview_muted = not self._preview_muted
+        self.previewChanged.emit()
+
+    @Slot(str)
+    def notePreview(self, message: str) -> None:
+        self._preview_playing = False
+        self._preview_note = message or "코덱 또는 스트리밍 제약으로 미리보기를 재생할 수 없습니다"
+        self.previewChanged.emit()
+
+    @Slot()
+    def openLogin(self) -> None:
+        url = self._url.strip()
+        if not url.startswith(("http://", "https://")):
+            self._notify("로그인할 페이지 주소가 없습니다.")
+            return
+        threading.Thread(target=self._login_thread, args=(url,), daemon=True).start()
+        self._notify("브라우저에서 직접 로그인하세요. 비밀번호는 입력하지 않습니다.")
+
+    def _login_thread(self, url: str) -> None:
+        from umd.auth.login import open_login_window
+        from umd.auth.session import SessionStore, active, set_active
+
+        store = active()
+        if store is None:
+            root = Path(os.environ.get("TEMP") or ".") / "umd-sessions"
+            store = SessionStore(root)
+            set_active(store)
+        try:
+            open_login_window(url, store)
+        except Exception as exc:
+            self._notify(str(exc)[:180])
+            return
+        self._notify("이 사이트의 임시 세션만 유지합니다. 다른 도메인으로는 전달하지 않습니다.")
+
+    @Slot()
+    def logoutSite(self) -> None:
+        from umd.auth.session import active
+
+        host = (urlsplit(self._url.strip()).hostname or "").lower()
+        store = active()
+        if store is not None and host:
+            store.delete(host)
+        self._notify("이 사이트의 임시 세션을 삭제했습니다.")
 
     @Slot()
     def selectAllVisible(self) -> None:
@@ -996,6 +1174,9 @@ class ShellState(QObject):
 
     @Slot()
     def analyze(self) -> None:
+        if self._quitting:
+            self._notify("종료를 기다리는 중입니다.")
+            return
         if not self._url.strip():
             self._notify("분석할 URL이 없습니다. 주소 입력은 미리보기만 동작합니다.")
             return
@@ -1071,6 +1252,9 @@ class ShellState(QObject):
 
     @Slot()
     def download(self) -> None:
+        if self._quitting:
+            self._notify("종료를 기다리는 중입니다.")
+            return
         rows = [self._model.item(index) for index in range(self._model.rowCount())]
         if not any(row.get("fetchUrl") for row in rows):
             self._notify("다운로드 엔진은 연결되지 않았습니다. 파일은 저장하지 않습니다.")
@@ -1078,8 +1262,16 @@ class ShellState(QObject):
         if self._download_thread is not None and self._download_thread.isRunning():
             self._notify("이미 다운로드 중입니다.")
             return
-        targets = [item for item in self._selected_targets() if item.get("status") != "완료"]
+        targets = [
+            item for item in self._selected_targets()
+            if item.get("status") not in {"완료", "재인증 필요"}
+        ]
         if not targets:
+            reauth = [item for item in self._selected_targets() if item.get("status") == "재인증 필요"]
+            if reauth:
+                self._notify("다시 인증해야 받을 수 있습니다.")
+                self._set_phase("재인증 필요")
+                return
             selected = self._selected_targets()
             if selected and all(item.get("status") == "완료" for item in selected):
                 self._notify("이미 완료된 항목입니다.")
@@ -1176,6 +1368,9 @@ class ShellState(QObject):
 
     @Slot()
     def resumeDownload(self) -> None:
+        if self._quitting:
+            self._notify("종료를 기다리는 중입니다.")
+            return
         if self._download_worker is None:
             return
         self._download_worker.resume()
@@ -1188,6 +1383,9 @@ class ShellState(QObject):
 
     @Slot()
     def retryFailed(self) -> None:
+        if self._quitting:
+            self._notify("종료를 기다리는 중입니다.")
+            return
         if self._download_thread is not None and self._download_thread.isRunning():
             self._notify("이미 다운로드 중입니다.")
             return
@@ -1350,7 +1548,9 @@ class ShellState(QObject):
         for item_id in self._active_ids:
             row = self._model.find_id(item_id)
             statuses.append(row["status"] if row else "실패")
-        if any(status == "실패" for status in statuses):
+        if any(status == "재인증 필요" for status in statuses):
+            phase = "재인증 필요"
+        elif any(status == "실패" for status in statuses):
             phase = "실패"
         elif any(status == "취소" for status in statuses):
             phase = "취소"
@@ -1365,6 +1565,8 @@ class ShellState(QObject):
             self._notify(f"{saved}개 파일을 저장했습니다.")
         elif phase == "취소":
             self._notify("다운로드를 취소했습니다.")
+        elif phase == "재인증 필요":
+            self._notify("다시 인증해야 이어서 받을 수 있습니다.")
         else:
             self._notify("일부 이미지를 저장하지 못했습니다.")
 
